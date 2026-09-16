@@ -47,9 +47,9 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 深度清理反馈评分、营销升级、Discord 加入等弹窗
+// 🛡️ 精准清理反馈、评分、营销升级、Discord 等干扰弹窗（保护续期主弹窗）
 async function forceDismissPopups(page) {
-  // 1. 关闭 Cookie 栏
+  // 1. 关闭 Cookie 协议栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
     if (await cookieBtn.isVisible({ timeout: 500 })) {
@@ -57,19 +57,31 @@ async function forceDismissPopups(page) {
     }
   } catch (e) {}
 
-  // 2. 点击可见的 Maybe later
-  for (let i = 0; i < 3; i++) {
-    try {
+  // 2. 仅在确实存在干扰弹窗时点击 Maybe later
+  try {
+    const isInterferingModalVisible = await page.evaluate(() => {
+      const txt = document.body.innerText || '';
+      return (
+        txt.includes('How would you rate FreeMCHost') ||
+        txt.includes('Your feedback') ||
+        txt.includes('Got an idea to make FreeMCHost better') ||
+        txt.includes('Get Free+ (2GB)') ||
+        txt.includes('Upgrade to Free+') ||
+        txt.includes('Join the FreeMCHost community')
+      );
+    });
+
+    if (isInterferingModalVisible) {
       const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
       if (await maybeLater.isVisible({ timeout: 600 })) {
         await maybeLater.click({ force: true });
         console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
         await page.waitForTimeout(400);
       }
-    } catch (e) {}
-  }
+    }
+  } catch (e) {}
 
-  // 3. 原生 DOM 精准移除干扰模态框
+  // 3. 原生 DOM 精准移除干扰模态框（设置严格白名单，绝不误触 Keep your server online）
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
     
@@ -89,24 +101,20 @@ async function forceDismissPopups(page) {
       let container = header;
       for (let i = 0; i < 7; i++) {
         if (container.parentElement && container.parentElement !== document.body) {
-          if (container.parentElement.innerText && container.parentElement.innerText.includes('Keep your server online')) {
-            break;
+          // 如果向上遍历碰到了续期弹窗，立即中止，避免破坏续期窗口
+          if (container.innerText && container.innerText.includes('Keep your server online')) {
+            return;
           }
           container = container.parentElement;
         }
       }
-      if (container && container !== document.body) {
+      if (container && container !== document.body && !container.innerText.includes('Keep your server online')) {
         container.remove();
       }
     });
-
-    const backdrops = allEls.filter(el => 
-      el.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
-    );
-    backdrops.forEach(b => b.remove());
   });
 
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(200);
 }
 
 // 模拟真实用户输入
@@ -125,7 +133,7 @@ async function safeFill(page, locator, value, label) {
   }
 }
 
-// 统一提取页面倒计时工具
+// 统一提取页面倒计时
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
@@ -152,7 +160,7 @@ async function extractExpiryTime(page) {
   });
 }
 
-// 安全截图工具：避免死等外部网络字体
+// 安全截图工具
 async function safeScreenshot(page, filePath) {
   try {
     await page.screenshot({ path: filePath, fullPage: false, timeout: 5000 });
@@ -272,17 +280,50 @@ async function safeScreenshot(page, filePath) {
           await renewBtn.click();
           await page.waitForTimeout(1500);
 
-          // 清理干扰弹窗
+          // 清理干扰弹窗（保护续期窗口）
           await forceDismissPopups(page);
 
-          // 核心优化：轮询等待 3-6 秒，直到 60 hours 卡片由灰变黑/变亮
           console.log('⏳ 正在等待 [60 hours] 选项从置灰变为可点击状态 (需等待 3-5 秒校验)...');
-          let readyToClick = false;
+          
+          // 等待模态框就绪
+          const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
+          await renewModal.waitFor({ state: 'visible', timeout: 10000 });
 
+          // 轮询检测是否脱离置灰
+          let isReady = false;
           for (let poll = 0; poll < 10; poll++) {
-            await forceDismissPopups(page);
+            isReady = await page.evaluate(() => {
+              const modal = document.querySelector('div:has(> *):not([aria-hidden="true"])');
+              const text = document.body.innerText || '';
+              // 如果仍有 "come back later" 说明接口校验还没变亮
+              if (text.toLowerCase().includes('come back later')) {
+                return false;
+              }
+              return true;
+            });
 
-            const isCardActive = await page.evaluate(() => {
+            if (isReady && poll >= 3) {
+              console.log(`✅ [60 hours] 选项状态已解锁！(耗时约 ${poll * 1.2} 秒)`);
+              break;
+            }
+            await page.waitForTimeout(1200);
+          }
+
+          // 定位并触发点击
+          console.log('👉 正在点击 [60 hours] 选项卡...');
+          let clicked = false;
+
+          // 方式 1：利用 Playwright 内置正则定位可点击区域
+          const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
+          if (await cardLocator.isVisible({ timeout: 3000 }).catch(() => false)) {
+            await cardLocator.click({ force: true });
+            clicked = true;
+            console.log('🎉 已通过定位器成功点击 [60 hours] 卡片！');
+          }
+
+          // 方式 2：原生 DOM 事件冒泡兜底
+          if (!clicked) {
+            clicked = await page.evaluate(() => {
               const allEls = Array.from(document.querySelectorAll('*'));
               const target = allEls.find(el => 
                 el.children.length === 0 && 
@@ -290,68 +331,29 @@ async function safeScreenshot(page, filePath) {
               );
               if (!target) return false;
 
-              // 向上寻找到卡片容器
               let p = target;
               for (let j = 0; j < 6; j++) {
                 if (p.parentElement && p.parentElement !== document.body) {
                   p = p.parentElement;
-                  const text = p.innerText || '';
-                  const classes = (p.className || '').toString();
-                  // 排除掉仍处于不可用或包含 come back later 提示的状态
-                  if (text.includes('come back later') || text.includes('open 46h before')) {
-                    return false;
-                  }
-                  // 若容器带有边框、鼠标手势或激活属性
-                  if (classes.includes('cursor-pointer') || classes.includes('border') || p.onclick || p.tagName === 'BUTTON') {
+                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || (p.className || '').includes('rounded')) {
+                    p.click();
                     return true;
                   }
                 }
               }
+              target.click();
               return true;
             });
-
-            if (isCardActive && poll >= 3) {
-              readyToClick = true;
-              console.log(`✅ [60 hours] 选项已就绪并激活变亮！(等待耗时约 ${poll * 1.2} 秒)`);
-              break;
+            if (clicked) {
+              console.log('🎉 已通过 DOM 原生派发触发 [60 hours] 点击！');
             }
-
-            await page.waitForTimeout(1200);
           }
 
-          // 物理鼠标坐标点击卡片
-          console.log('👉 正在物理点击 [60 hours] 卡片中心...');
-          const opt60Locator = page.locator('text="60 hours"').first();
-          await opt60Locator.waitFor({ state: 'visible', timeout: 5000 });
-          
-          // 获取卡片容器并触发点击
-          const boundingBox = await opt60Locator.boundingBox();
-          if (boundingBox) {
-            await page.mouse.click(boundingBox.x + boundingBox.width / 2, boundingBox.y + boundingBox.height / 2);
-          } else {
-            await opt60Locator.click({ force: true });
-          }
-
-          // 兜底：DOM 级向外层容器再发一次 click 事件
-          await page.evaluate(() => {
-            const allEls = Array.from(document.querySelectorAll('*'));
-            const target = allEls.find(el => el.children.length === 0 && el.textContent.trim().toLowerCase().includes('60 hours'));
-            if (target) {
-              let p = target;
-              for (let j = 0; j < 6; j++) {
-                if (p.parentElement && p.parentElement !== document.body) {
-                  p = p.parentElement;
-                  p.click();
-                }
-              }
-            }
-          });
-
-          console.log('⏳ 指令已下发，等待服务端完成续期并刷新数据...');
+          console.log('⏳ 续期指令已发出，等待数据重绘...');
           await page.waitForTimeout(5000);
           await forceDismissPopups(page);
 
-          // 重新读取页面倒计时
+          // 验证更新后的倒计时
           const newTimeData = await extractExpiryTime(page);
           const newRemainStr = newTimeData ? newTimeData.raw : '未获取到';
           console.log(`⏱️ 续期后页面剩余时长: ${newRemainStr}`);
