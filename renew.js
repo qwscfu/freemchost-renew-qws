@@ -61,15 +61,15 @@ async function forceDismissPopups(page) {
   for (let i = 0; i < 3; i++) {
     try {
       const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
-      if (await maybeLater.isVisible({ timeout: 800 })) {
+      if (await maybeLater.isVisible({ timeout: 600 })) {
         await maybeLater.click({ force: true });
-        console.log('🛡️ 已点击 [Maybe later] 关闭弹窗');
+        console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
         await page.waitForTimeout(400);
       }
     } catch (e) {}
   }
 
-  // 3. 原生 DOM 精准移除干扰模态框（打分、反馈、免费升级、Discord等）
+  // 3. 原生 DOM 精准移除干扰模态框
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
     
@@ -100,7 +100,6 @@ async function forceDismissPopups(page) {
       }
     });
 
-    // 清理遗留的全屏遮罩
     const backdrops = allEls.filter(el => 
       el.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
     );
@@ -151,6 +150,15 @@ async function extractExpiryTime(page) {
     }
     return null;
   });
+}
+
+// 安全截图工具：避免死等外部网络字体
+async function safeScreenshot(page, filePath) {
+  try {
+    await page.screenshot({ path: filePath, fullPage: false, timeout: 5000 });
+  } catch (e) {
+    console.log(`⚠️ 截图生成跳过: ${e.message}`);
+  }
 }
 
 (async () => {
@@ -264,15 +272,17 @@ async function extractExpiryTime(page) {
           await renewBtn.click();
           await page.waitForTimeout(1500);
 
-          // 清理叠加的评分等干扰弹窗
+          // 清理干扰弹窗
           await forceDismissPopups(page);
-          await page.waitForTimeout(1000);
 
-          console.log('👉 正在定位并点击 [60 hours] 卡片...');
-          let cardClicked = false;
-          for (let attempt = 0; attempt < 3; attempt++) {
+          // 核心优化：轮询等待 3-6 秒，直到 60 hours 卡片由灰变黑/变亮
+          console.log('⏳ 正在等待 [60 hours] 选项从置灰变为可点击状态 (需等待 3-5 秒校验)...');
+          let readyToClick = false;
+
+          for (let poll = 0; poll < 10; poll++) {
             await forceDismissPopups(page);
-            cardClicked = await page.evaluate(() => {
+
+            const isCardActive = await page.evaluate(() => {
               const allEls = Array.from(document.querySelectorAll('*'));
               const target = allEls.find(el => 
                 el.children.length === 0 && 
@@ -280,40 +290,74 @@ async function extractExpiryTime(page) {
               );
               if (!target) return false;
 
+              // 向上寻找到卡片容器
               let p = target;
               for (let j = 0; j < 6; j++) {
                 if (p.parentElement && p.parentElement !== document.body) {
                   p = p.parentElement;
-                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || p.classList.toString().includes('cursor-pointer') || p.classList.toString().includes('rounded')) {
-                    p.click();
+                  const text = p.innerText || '';
+                  const classes = (p.className || '').toString();
+                  // 排除掉仍处于不可用或包含 come back later 提示的状态
+                  if (text.includes('come back later') || text.includes('open 46h before')) {
+                    return false;
+                  }
+                  // 若容器带有边框、鼠标手势或激活属性
+                  if (classes.includes('cursor-pointer') || classes.includes('border') || p.onclick || p.tagName === 'BUTTON') {
                     return true;
                   }
                 }
               }
-              target.click();
               return true;
             });
 
-            if (cardClicked) {
-              console.log('🎉 已成功触发 [60 hours] 选项卡点击！');
+            if (isCardActive && poll >= 3) {
+              readyToClick = true;
+              console.log(`✅ [60 hours] 选项已就绪并激活变亮！(等待耗时约 ${poll * 1.2} 秒)`);
               break;
             }
-            await page.waitForTimeout(1000);
+
+            await page.waitForTimeout(1200);
           }
 
-          // 点完即生效，等待 4 秒让倒计时完成重绘
-          console.log('⏳ 等待服务端完成续期并刷新数据...');
-          await page.waitForTimeout(4000);
-          // 清除随后可能弹出的 Discord 推广弹窗
+          // 物理鼠标坐标点击卡片
+          console.log('👉 正在物理点击 [60 hours] 卡片中心...');
+          const opt60Locator = page.locator('text="60 hours"').first();
+          await opt60Locator.waitFor({ state: 'visible', timeout: 5000 });
+          
+          // 获取卡片容器并触发点击
+          const boundingBox = await opt60Locator.boundingBox();
+          if (boundingBox) {
+            await page.mouse.click(boundingBox.x + boundingBox.width / 2, boundingBox.y + boundingBox.height / 2);
+          } else {
+            await opt60Locator.click({ force: true });
+          }
+
+          // 兜底：DOM 级向外层容器再发一次 click 事件
+          await page.evaluate(() => {
+            const allEls = Array.from(document.querySelectorAll('*'));
+            const target = allEls.find(el => el.children.length === 0 && el.textContent.trim().toLowerCase().includes('60 hours'));
+            if (target) {
+              let p = target;
+              for (let j = 0; j < 6; j++) {
+                if (p.parentElement && p.parentElement !== document.body) {
+                  p = p.parentElement;
+                  p.click();
+                }
+              }
+            }
+          });
+
+          console.log('⏳ 指令已下发，等待服务端完成续期并刷新数据...');
+          await page.waitForTimeout(5000);
           await forceDismissPopups(page);
 
-          // 抓取续期后的新时长
+          // 重新读取页面倒计时
           const newTimeData = await extractExpiryTime(page);
-          const newRemainStr = newTimeData ? newTimeData.raw : '已满血加时';
+          const newRemainStr = newTimeData ? newTimeData.raw : '未获取到';
           console.log(`⏱️ 续期后页面剩余时长: ${newRemainStr}`);
 
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${newRemainStr}</b>`);
-          await page.screenshot({ path: `screenshots/renew-success-server-${sIndex}.png`, fullPage: true });
+          await safeScreenshot(page, `screenshots/renew-success-server-${sIndex}.png`);
 
         } else {
           console.log(`⏳ 服务器 [${sIndex}] 距离 46h 开放还差约 ${(remainHours - 46).toFixed(1)} 小时，保持等待。`);
@@ -323,9 +367,7 @@ async function extractExpiryTime(page) {
       } catch (innerErr) {
         console.error(`❌ 服务器 [${sIndex}] 处理异常:`, innerErr.message);
         reports.push(`🔴 <b>服务器 ${sIndex}</b>: 巡检失败 (${innerErr.message.substring(0, 30)})`);
-        try {
-          await page.screenshot({ path: `screenshots/error-server-${sIndex}.png`, fullPage: true });
-        } catch (e) {}
+        await safeScreenshot(page, `screenshots/error-server-${sIndex}.png`);
       }
     }
 
@@ -335,9 +377,7 @@ async function extractExpiryTime(page) {
 
   } catch (error) {
     console.error('❌ 全局致命错误:', error.message);
-    try {
-      await page.screenshot({ path: 'screenshots/renew_fatal.png', fullPage: true });
-    } catch (e) {}
+    await safeScreenshot(page, 'screenshots/renew_fatal.png');
     await sendTelegramMessage(tgToken, tgChatId, `🚨 <b>Freemchost 运行崩溃:</b> <code>${error.message}</code>`);
     process.exitCode = 1;
   } finally {
