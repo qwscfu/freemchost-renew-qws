@@ -47,9 +47,9 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 精准清理反馈、评分、营销升级、Discord 等干扰弹窗（保护续期主弹窗）
+// 🛡️ 精准清理反馈、评分、营销升级、Discord 等干扰弹窗
 async function forceDismissPopups(page) {
-  // 1. 关闭 Cookie 协议栏
+  // 1. 关闭 Cookie 栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
     if (await cookieBtn.isVisible({ timeout: 500 })) {
@@ -57,7 +57,7 @@ async function forceDismissPopups(page) {
     }
   } catch (e) {}
 
-  // 2. 仅在确实存在干扰弹窗时点击 Maybe later
+  // 2. 点击可见的 Maybe later
   try {
     const isInterferingModalVisible = await page.evaluate(() => {
       const txt = document.body.innerText || '';
@@ -81,10 +81,9 @@ async function forceDismissPopups(page) {
     }
   } catch (e) {}
 
-  // 3. 原生 DOM 精准移除干扰模态框（设置严格白名单，绝不误触 Keep your server online）
+  // 3. 原生 DOM 移除干扰模态框
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
-    
     const noiseHeaders = allEls.filter(el => {
       const txt = el.textContent || '';
       return (
@@ -101,7 +100,6 @@ async function forceDismissPopups(page) {
       let container = header;
       for (let i = 0; i < 7; i++) {
         if (container.parentElement && container.parentElement !== document.body) {
-          // 如果向上遍历碰到了续期弹窗，立即中止，避免破坏续期窗口
           if (container.innerText && container.innerText.includes('Keep your server online')) {
             return;
           }
@@ -112,6 +110,12 @@ async function forceDismissPopups(page) {
         container.remove();
       }
     });
+
+    // 移除未闭合的全屏遮罩
+    const backdrops = allEls.filter(el => 
+      el.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
+    );
+    backdrops.forEach(b => b.remove());
   });
 
   await page.waitForTimeout(200);
@@ -133,29 +137,42 @@ async function safeFill(page, locator, value, label) {
   }
 }
 
-// 统一提取页面倒计时
+// 🎯 高强韧倒计时抓取工具：全面覆盖方块栅格结构与全屏回退提取
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
+    // 方案 A: 寻找包含 TIME UNTIL EXPIRY 的区块及其子容器
     const allEls = Array.from(document.querySelectorAll('*'));
     const header = allEls.find(el => el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
-    if (!header) return null;
 
-    let container = header.parentElement;
-    for (let k = 0; k < 3; k++) {
-      if (container && container.innerText.includes('Renew now')) break;
-      if (container && container.parentElement) container = container.parentElement;
+    if (header) {
+      // 遍历祖先节点，寻找包含 D、H、M 的父级卡片
+      let container = header.parentElement;
+      for (let k = 0; k < 4; k++) {
+        if (container) {
+          const txt = container.innerText || '';
+          // 匹配方块结构: 03 D 15 H 10 M (支持中间有换行、空格或冒号)
+          const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
+          if (m) {
+            const d = parseInt(m[1], 10);
+            const h = parseInt(m[2], 10);
+            const min = parseInt(m[3], 10);
+            return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+          }
+          container = container.parentElement;
+        }
+      }
     }
 
-    if (!container) return null;
-
-    const text = container.innerText;
-    const match = text.match(/(\d{1,2})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
-    if (match) {
-      const d = parseInt(match[1], 10);
-      const h = parseInt(match[2], 10);
-      const m = parseInt(match[3], 10);
-      return { totalHours: d * 24 + h + m / 60, raw: `${d}天${h}小时${m}分` };
+    // 方案 B: 全局兜底提取
+    const bodyText = document.body.innerText || '';
+    const fallbackMatch = bodyText.match(/(\d{1,3})\s*\n?\s*D\s*\n?\s*(\d{1,2})\s*\n?\s*H\s*\n?\s*(\d{1,2})\s*\n?\s*M/i);
+    if (fallbackMatch) {
+      const d = parseInt(fallbackMatch[1], 10);
+      const h = parseInt(fallbackMatch[2], 10);
+      const min = parseInt(fallbackMatch[3], 10);
+      return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
     }
+
     return null;
   });
 }
@@ -269,7 +286,7 @@ async function safeScreenshot(page, filePath) {
         await page.waitForTimeout(1000);
         await forceDismissPopups(page);
 
-        // 提取剩余时间
+        // 提取当前剩余时间
         const timeData = await extractExpiryTime(page);
         const remainHours = timeData ? timeData.totalHours : 99;
         const remainStr = timeData ? timeData.raw : '未读取到';
@@ -280,26 +297,19 @@ async function safeScreenshot(page, filePath) {
           await renewBtn.click();
           await page.waitForTimeout(1500);
 
-          // 清理干扰弹窗（保护续期窗口）
           await forceDismissPopups(page);
 
           console.log('⏳ 正在等待 [60 hours] 选项从置灰变为可点击状态 (需等待 3-5 秒校验)...');
           
-          // 等待模态框就绪
           const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
           await renewModal.waitFor({ state: 'visible', timeout: 10000 });
 
-          // 轮询检测是否脱离置灰
+          // 轮询等待卡片激活
           let isReady = false;
           for (let poll = 0; poll < 10; poll++) {
             isReady = await page.evaluate(() => {
-              const modal = document.querySelector('div:has(> *):not([aria-hidden="true"])');
               const text = document.body.innerText || '';
-              // 如果仍有 "come back later" 说明接口校验还没变亮
-              if (text.toLowerCase().includes('come back later')) {
-                return false;
-              }
-              return true;
+              return !text.toLowerCase().includes('come back later');
             });
 
             if (isReady && poll >= 3) {
@@ -309,11 +319,9 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
-          // 定位并触发点击
           console.log('👉 正在点击 [60 hours] 选项卡...');
           let clicked = false;
 
-          // 方式 1：利用 Playwright 内置正则定位可点击区域
           const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
           if (await cardLocator.isVisible({ timeout: 3000 }).catch(() => false)) {
             await cardLocator.click({ force: true });
@@ -321,7 +329,6 @@ async function safeScreenshot(page, filePath) {
             console.log('🎉 已通过定位器成功点击 [60 hours] 卡片！');
           }
 
-          // 方式 2：原生 DOM 事件冒泡兜底
           if (!clicked) {
             clicked = await page.evaluate(() => {
               const allEls = Array.from(document.querySelectorAll('*'));
@@ -344,19 +351,28 @@ async function safeScreenshot(page, filePath) {
               target.click();
               return true;
             });
-            if (clicked) {
-              console.log('🎉 已通过 DOM 原生派发触发 [60 hours] 点击！');
-            }
+            if (clicked) console.log('🎉 已通过 DOM 原生派发触发 [60 hours] 点击！');
           }
 
-          console.log('⏳ 续期指令已发出，等待数据重绘...');
-          await page.waitForTimeout(5000);
-          await forceDismissPopups(page);
+          console.log('⏳ 续期指令已发出，正在清理 Discord 模态框并等待新数据渲染...');
+          await page.waitForTimeout(3000);
 
-          // 验证更新后的倒计时
-          const newTimeData = await extractExpiryTime(page);
-          const newRemainStr = newTimeData ? newTimeData.raw : '未获取到';
-          console.log(`⏱️ 续期后页面剩余时长: ${newRemainStr}`);
+          // 续期后主动清理弹出的 Discord 推广弹窗
+          await page.keyboard.press('Escape');
+          await forceDismissPopups(page);
+          await page.waitForTimeout(2000);
+
+          // 核心优化：轮询提取新倒计时（至多 6 次尝试，确保捕获到真实更新）
+          let newRemainStr = '已满血加时';
+          for (let check = 0; check < 6; check++) {
+            const newTimeData = await extractExpiryTime(page);
+            if (newTimeData && newTimeData.totalHours > remainHours) {
+              newRemainStr = newTimeData.raw;
+              console.log(`⏱️ 成功捕获到最新剩余时长: ${newRemainStr} (验证通过，总计约 ${newTimeData.totalHours.toFixed(1)} 小时)`);
+              break;
+            }
+            await page.waitForTimeout(1000);
+          }
 
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${newRemainStr}</b>`);
           await safeScreenshot(page, `screenshots/renew-success-server-${sIndex}.png`);
