@@ -49,13 +49,15 @@ async function sendTelegramMessage(botToken, chatId, text) {
 
 // 🛡️ 精准清理反馈、评分、营销升级、Discord 等干扰弹窗
 async function forceDismissPopups(page) {
+  // 1. 关闭 Cookie 协议栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
-    if (await cookieBtn.isVisible({ timeout: 500 })) {
+    if (await cookieBtn.isVisible({ timeout: 400 })) {
       await cookieBtn.click();
     }
   } catch (e) {}
 
+  // 2. 点击可见的 Maybe later
   try {
     const isInterferingModalVisible = await page.evaluate(() => {
       const txt = document.body.innerText || '';
@@ -71,14 +73,15 @@ async function forceDismissPopups(page) {
 
     if (isInterferingModalVisible) {
       const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
-      if (await maybeLater.isVisible({ timeout: 600 })) {
+      if (await maybeLater.isVisible({ timeout: 500 })) {
         await maybeLater.click({ force: true });
         console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(300);
       }
     }
   } catch (e) {}
 
+  // 3. 原生 DOM 移除干扰模态框（设置严格白名单，绝不误触 Keep your server online）
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
     const noiseHeaders = allEls.filter(el => {
@@ -148,11 +151,11 @@ async function switchToBillingTab(page) {
       }
     }
   }
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(2500);
   await forceDismissPopups(page);
 }
 
-// 高强韧倒计时提取
+// 倒计时提取器
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
@@ -238,6 +241,16 @@ async function safeScreenshot(page, filePath) {
   });
 
   const page = await context.newPage();
+
+  // 监听全站底层异步请求，追踪真实续期发包
+  page.on('response', response => {
+    const req = response.request();
+    const url = response.url();
+    if (req.method() === 'POST' && (url.includes('/renew') || url.includes('/servers') || url.includes('/billing'))) {
+      console.log(`📡 捕获续期发包: [${req.method()}] ${url} -> HTTP ${response.status()}`);
+    }
+  });
+
   let reports = [];
 
   try {
@@ -280,6 +293,7 @@ async function safeScreenshot(page, filePath) {
         await page.waitForTimeout(1000);
         await forceDismissPopups(page);
 
+        // 提取基准剩余时间
         const timeData = await extractExpiryTime(page);
         const remainHours = timeData ? timeData.totalHours : 99;
         const remainStr = timeData ? timeData.raw : '未读取到';
@@ -295,9 +309,9 @@ async function safeScreenshot(page, filePath) {
           const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
           await renewModal.waitFor({ state: 'visible', timeout: 10000 });
 
-          let isReady = false;
+          // 等待解除禁用置灰
           for (let poll = 0; poll < 10; poll++) {
-            isReady = await page.evaluate(() => {
+            const isReady = await page.evaluate(() => {
               const text = document.body.innerText || '';
               return !text.toLowerCase().includes('come back later');
             });
@@ -309,76 +323,78 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
-          console.log('👉 正在点击 [60 hours] 选项卡...');
-          let clicked = false;
-          const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
-          if (await cardLocator.isVisible({ timeout: 3000 }).catch(() => false)) {
-            await cardLocator.click({ force: true });
-            clicked = true;
-            console.log('🎉 已通过定位器成功点击 [60 hours] 卡片！');
+          console.log('👉 正在点击 [60 hours] 外部卡片容器...');
+          
+          // 定位包含 60 hours 且包含 Discord Boosted 的完整外层容器
+          const cardContainer = page.locator('div, button').filter({ hasText: '60 hours' }).filter({ hasText: 'Discord Boosted' }).last();
+          await cardContainer.waitFor({ state: 'visible', timeout: 5000 });
+
+          // 物理鼠标点击中心点
+          await cardContainer.scrollIntoViewIfNeeded();
+          const box = await cardContainer.boundingBox();
+          if (box) {
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          } else {
+            await cardContainer.click();
           }
 
-          if (!clicked) {
-            clicked = await page.evaluate(() => {
-              const allEls = Array.from(document.querySelectorAll('*'));
-              const target = allEls.find(el => 
-                el.children.length === 0 && 
-                el.textContent.trim().toLowerCase().includes('60 hours')
-              );
-              if (!target) return false;
+          // 原生 DOM 事件冒泡兜底，确保父级事件监听触发
+          await page.evaluate(() => {
+            const allEls = Array.from(document.querySelectorAll('*'));
+            const target = allEls.find(el => 
+              el.children.length === 0 && 
+              el.textContent.trim().toLowerCase().includes('60 hours')
+            );
+            if (!target) return;
 
-              let p = target;
-              for (let j = 0; j < 6; j++) {
-                if (p.parentElement && p.parentElement !== document.body) {
-                  p = p.parentElement;
-                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || (p.className || '').includes('rounded')) {
-                    p.click();
-                    return true;
-                  }
+            let p = target;
+            for (let j = 0; j < 6; j++) {
+              if (p.parentElement && p.parentElement !== document.body) {
+                p = p.parentElement;
+                if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || (p.className || '').includes('rounded')) {
+                  p.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                  return;
                 }
               }
-              target.click();
-              return true;
-            });
-            if (clicked) console.log('🎉 已通过 DOM 原生派发触发 [60 hours] 点击！');
-          }
+            }
+          });
 
-          console.log('⏳ 指令已下发，等待服务端入账 (4 秒)...');
-          await page.waitForTimeout(4000);
+          // 等待网络发包与数据库入账（不中断、不按 Escape）
+          console.log('⏳ 物理点击完成，等待服务器完成入库与响应 (8 秒)...');
+          await page.waitForTimeout(8000);
 
-          // 核心重置流程：关弹窗 -> 刷新页面 -> 重新切回 PLAN Billing 提取最新准确倒计时
-          console.log('🔄 正在退出续期弹窗并刷新页面...');
-          await page.keyboard.press('Escape');
-          await page.waitForTimeout(500);
+          // 关闭可能弹出的 Discord 推广弹窗
           await forceDismissPopups(page);
 
-          console.log('🔃 重新加载当前服务器面板...');
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-          await page.waitForTimeout(2500);
+          // 关键核验：全新重载页面，杜绝前端内存虚假数据
+          console.log('🔃 正在硬重载页面，向服务端核对真实续期状态...');
+          await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 60000 });
+          await page.waitForTimeout(2000);
           await forceDismissPopups(page);
 
-          console.log('🗂️ 重新进入 [PLAN Billing] 标签页读取最新数据...');
+          console.log('🗂️ 重新进入 [PLAN Billing] 标签页读取真实数据库倒计时...');
           await switchToBillingTab(page);
 
           const reloadRenewBtn = page.locator('button:has-text("Renew now")').first();
           await reloadRenewBtn.waitFor({ state: 'visible', timeout: 15000 });
           await page.waitForTimeout(1000);
 
-          let newRemainStr = '已满血加时';
-          for (let check = 0; check < 5; check++) {
-            const newTimeData = await extractExpiryTime(page);
-            if (newTimeData && newTimeData.totalHours > remainHours) {
-              newRemainStr = newTimeData.raw;
-              console.log(`⏱️ 刷新验证通过！获取到最新倒计时: ${newRemainStr} (总计约 ${newTimeData.totalHours.toFixed(1)} 小时)`);
-              break;
-            } else if (newTimeData) {
-              newRemainStr = newTimeData.raw;
-            }
-            await page.waitForTimeout(1000);
-          }
+          const newTimeData = await extractExpiryTime(page);
+          const finalHours = newTimeData ? newTimeData.totalHours : remainHours;
+          const newRemainStr = newTimeData ? newTimeData.raw : '未读取到';
 
-          reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${newRemainStr}</b>`);
-          await safeScreenshot(page, `screenshots/renew-success-server-${sIndex}.png`);
+          console.log(`⏱️ 最终服务端核验结果: 前序 ${remainHours.toFixed(1)}h ➔ 当前 ${finalHours.toFixed(1)}h (${newRemainStr})`);
+
+          // 严格真机逻辑判定：只有增加超过 20 小时才判定成功
+          if (finalHours > remainHours + 20) {
+            console.log('🎉 验证通过：服务端真实倒计时已更新生效！');
+            reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${newRemainStr}</b>`);
+            await safeScreenshot(page, `screenshots/renew-success-server-${sIndex}.png`);
+          } else {
+            console.error('⚠️ 警告：服务端实际倒计时未见增加，本次可能未成功写入！');
+            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期请求已提交但服务端未加时 (仍为: ${newRemainStr})\n     └ 机制: 下个周期将自动重试`);
+            await safeScreenshot(page, `screenshots/renew-failed-server-${sIndex}.png`);
+          }
 
         } else {
           console.log(`⏳ 服务器 [${sIndex}] 距离 46h 开放还差约 ${(remainHours - 46).toFixed(1)} 小时，保持等待。`);
