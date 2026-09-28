@@ -47,7 +47,7 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 稳健清理干扰弹窗（彻底防空指针崩溃）
+// 🛡️ 稳健清理干扰弹窗
 async function forceDismissPopups(page) {
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
@@ -325,83 +325,56 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
-          // 彻底扫除打分弹窗并等待动画卸载
           console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
           await forceDismissPopups(page);
-          await page.waitForTimeout(1000); // 确保弹窗淡出动画完全结束
+          await page.waitForTimeout(1000);
 
-          console.log('👉 准备发起高精度真实交互点击 [60 hours]...');
-
-          // 核心加固：只监听打分弹窗彻底关闭之后发出的 RPC 响应
-          let renewSuccessReceived = false;
-          const rpcListener = async res => {
-            const req = res.request();
-            const url = res.url();
-            if (req.method() === 'POST' && url.includes('_serverFn') && res.status() === 200) {
-              try {
-                const body = await res.text();
-                // 排除打分反馈相关的 response
-                if (!body.includes('feedback') && !body.includes('rating')) {
-                  renewSuccessReceived = true;
-                  console.log(`📡 捕获到续期专用核心 RPC 响应: ${url.substring(0, 70)}...`);
-                }
-              } catch (e) {}
-            }
-          };
-          page.on('response', rpcListener);
-
-          // 锁定弹窗内部包含 60 hours 的卡片容器
+          // 核心两段式提交：选择卡片 -> 触发最终确认
+          console.log('👉 步骤 1/2: 正在选择并激活 [60 hours] 选项卡...');
           const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).filter({ hasText: 'Discord' }).last();
           
-          for (let attempt = 1; attempt <= 4; attempt++) {
-            console.log(`🖱️ 正在执行交互尝试 #${attempt}...`);
-            
-            // 真实物理鼠标点击中心点
-            try {
-              const box = await card.boundingBox({ timeout: 2500 });
-              if (box) {
-                await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-                await page.waitForTimeout(100);
-                await page.mouse.down();
-                await page.waitForTimeout(150);
-                await page.mouse.up();
-                console.log('👆 物理鼠标按下与释放完成！');
-              } else {
-                await card.click({ force: true });
+          await card.scrollIntoViewIfNeeded();
+          await card.hover();
+          await page.waitForTimeout(150);
+          await card.click({ delay: 100 });
+          console.log('👆 已物理点击选中 [60 hours] 卡片！');
+          await page.waitForTimeout(1000);
+
+          console.log('👉 步骤 2/2: 正在寻找并触发最终确认续期按钮 (Commit Action)...');
+          let commitDone = false;
+
+          // 方式 A: 弹窗底部常有的确认/延长按钮 (Extend, Confirm, Renew, Continue)
+          const commitBtns = renewModal.locator('button').filter({ hasText: /extend|confirm|renew|continue|keep online/i });
+          const bCount = await commitBtns.count();
+          for (let b = 0; b < bCount; b++) {
+            const btn = commitBtns.nth(b);
+            if (await btn.isVisible() && await btn.isEnabled()) {
+              const bText = await btn.innerText();
+              // 排除关闭按钮或 Maybe later
+              if (!bText.includes('Maybe later') && !bText.includes('Cancel')) {
+                await btn.click({ force: true });
+                console.log(`🚀 成功点击模态框提交按钮: [${bText.replace(/\n/g, ' ')}]`);
+                commitDone = true;
+                break;
               }
-            } catch (e) {
-              await card.click({ force: true }).catch(() => {});
             }
-
-            // 备选辅助：触发卡片子节点的直接点击
-            await page.evaluate(() => {
-              const allEls = Array.from(document.querySelectorAll('*'));
-              const target = allEls.find(el => el.textContent && el.textContent.includes('60 hours') && el.textContent.includes('Discord'));
-              if (target) {
-                target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-              }
-            });
-
-            // 等待 3 秒观察是否有续期发包
-            for (let w = 0; w < 6; w++) {
-              if (renewSuccessReceived) break;
-              await page.waitForTimeout(500);
-            }
-
-            if (renewSuccessReceived) {
-              console.log('🎉 续期发包确认触发成功！');
-              break;
-            }
-            console.log('⚠️ 本次尝试未捕获续期发包，正在重试点击...');
-            await forceDismissPopups(page);
-            await page.waitForTimeout(500);
           }
 
-          page.off('response', rpcListener);
+          // 方式 B: 双击卡片或按回车键进行表单提交
+          if (!commitDone) {
+            console.log('⌨️ 未检测到独立提交按钮，执行双击与 Enter 键确认提交...');
+            await card.dblclick({ force: true }).catch(() => {});
+            await page.keyboard.press('Enter');
+            await page.keyboard.press('Space');
+          }
 
-          // 会话保温 30 秒，确保异步事务完整提交
-          console.log('☕ 会话保温中：保持浏览器在线 30 秒，确保后端 Discord 异步校验与事务完全落库...');
-          for (let warm = 0; warm < 6; warm++) {
+          // 监听并打印真实提交发包
+          await page.waitForTimeout(3000);
+          await forceDismissPopups(page);
+
+          // 会话保温 25 秒，让所有后续事务和 Socket/Discord 状态完全持久化
+          console.log('☕ 会话保温中：保持浏览器在线 25 秒，确保后端事务完全提交...');
+          for (let warm = 0; warm < 5; warm++) {
             await page.waitForTimeout(5000);
             await forceDismissPopups(page);
           }
@@ -416,7 +389,7 @@ async function safeScreenshot(page, filePath) {
           const immediateHours = immediateTimeData ? immediateTimeData.totalHours : remainHours;
           console.log(`⏱️ 本会话刷新后时长: ${immediateTimeData ? immediateTimeData.raw : '未获取到'} (约 ${immediateHours.toFixed(1)}h)`);
 
-          // 核心硬核验：独立全新 Context 隔离核验真实入库数据
+          // 独立全新 Context 隔离终审核验真实入库数据
           console.log('🔍 正在启动【独立会话沙盒 (完全独立 Context)】终审硬核验...');
           const freshContext = await browser.newContext({
             viewport: { width: 1920, height: 1080 },
