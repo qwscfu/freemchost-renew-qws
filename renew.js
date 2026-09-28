@@ -47,9 +47,8 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 稳健清理干扰弹窗（彻底防空指针崩溃）
+// 🛡️ 稳健清理干扰弹窗
 async function forceDismissPopups(page) {
-  // 1. 关闭 Cookie 协议栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
     if (await cookieBtn.isVisible({ timeout: 400 })) {
@@ -57,7 +56,6 @@ async function forceDismissPopups(page) {
     }
   } catch (e) {}
 
-  // 2. 连续尝试点击可见的 Maybe later
   for (let i = 0; i < 2; i++) {
     try {
       const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
@@ -69,7 +67,6 @@ async function forceDismissPopups(page) {
     } catch (e) {}
   }
 
-  // 3. 原生 DOM 移除干扰模态框（安全链，杜绝 null 异常）
   try {
     await page.evaluate(() => {
       const allEls = Array.from(document.querySelectorAll('*'));
@@ -134,14 +131,13 @@ async function safeFill(page, locator, value, label) {
   }
 }
 
-// 强制切换至 PLAN Billing 标签页（增加多次尝试与确认机制）
+// 强制切换至 PLAN Billing 标签页
 async function switchToBillingTab(page) {
   for (let attempt = 0; attempt < 3; attempt++) {
     await forceDismissPopups(page);
     
     const tabCandidates = page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i });
     const count = await tabCandidates.count();
-    let clicked = false;
     
     for (let idx = 0; idx < count; idx++) {
       const item = tabCandidates.nth(idx);
@@ -150,7 +146,6 @@ async function switchToBillingTab(page) {
         if (!txt.includes('Total') && (txt.includes('Billing') || txt.includes('PLAN'))) {
           await item.click({ force: true });
           console.log(`👉 已点击标签: [${txt.replace(/\n/g, ' ')}] (尝试 ${attempt + 1})`);
-          clicked = true;
           break;
         }
       }
@@ -159,7 +154,6 @@ async function switchToBillingTab(page) {
     await page.waitForTimeout(2000);
     await forceDismissPopups(page);
 
-    // 检查页面是否成功渲染出了 Plan & lifecycle 区域或 Renew now 按钮
     const hasBillingContent = await page.evaluate(() => {
       const text = document.body.innerText || '';
       return text.includes('Plan & lifecycle') || text.includes('TIME UNTIL EXPIRY') || text.includes('Renew now');
@@ -331,86 +325,87 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
-          console.log('👉 发起高精度全事件链点击 [60 hours]...');
+          console.log('👉 准备发起真实物理鼠标交互点击 [60 hours]...');
 
-          // 核心：全套 Pointer / Mouse 事件派发 + 内外层贯通
-          await page.evaluate(() => {
-            const allEls = Array.from(document.querySelectorAll('*'));
-            const textEl = allEls.find(el => 
-              el && el.children.length === 0 && 
-              el.textContent.trim().toLowerCase().includes('60 hours')
-            );
-            if (!textEl) return;
+          // 前置布设网络响应监听器，等待真实的 _serverFn RPC 响应
+          const rpcPromise = page.waitForResponse(res => {
+            const req = res.request();
+            const url = res.url();
+            return req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew'));
+          }, { timeout: 12000 }).catch(() => null);
 
-            let card = textEl;
-            for (let j = 0; j < 6; j++) {
-              if (card && card.parentElement && card.parentElement !== document.body) {
-                const cls = (card.parentElement.className || '').toString();
-                if (cls.includes('rounded') || cls.includes('border') || card.parentElement.tagName === 'BUTTON') {
-                  card = card.parentElement;
-                  break;
-                }
-                card = card.parentElement;
-              }
-            }
+          // 获取 60 hours 卡片容器
+          const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
+          await cardLocator.scrollIntoViewIfNeeded();
+          const box = await cardLocator.boundingBox();
 
-            if (!card) return;
-            const rect = card.getBoundingClientRect();
-            const clientX = rect.left + rect.width / 2;
-            const clientY = rect.top + rect.height / 2;
-            const opts = { bubbles: true, cancelable: true, view: window, clientX, clientY };
+          if (box) {
+            // 真实鼠标轨迹：移动 -> 悬停 -> 按下 -> 停留 -> 释放
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+            await page.waitForTimeout(150);
+            await page.mouse.down();
+            await page.waitForTimeout(120);
+            await page.mouse.up();
+            console.log('🖱️ 真实物理鼠标点击序列已触发！');
+          } else {
+            await cardLocator.click({ force: true });
+          }
 
-            card.dispatchEvent(new PointerEvent('pointerdown', opts));
-            card.dispatchEvent(new MouseEvent('mousedown', opts));
-            card.focus();
-            card.dispatchEvent(new PointerEvent('pointerup', opts));
-            card.dispatchEvent(new MouseEvent('mouseup', opts));
-            card.dispatchEvent(new MouseEvent('click', opts));
+          // 辅助原生物理点击
+          await cardLocator.click({ force: true, delay: 50 }).catch(() => {});
 
-            const innerBtn = card.querySelector('button, input');
-            if (innerBtn) {
-              innerBtn.click();
-            }
-          });
+          console.log('⏳ 等待服务端真实响应 (等待 _serverFn RPC 返回)...');
+          const rpcRes = await rpcPromise;
+          if (rpcRes) {
+            console.log(`📡 核心 RPC 接口已响应: ${rpcRes.url()} -> HTTP ${rpcRes.status()}`);
+          } else {
+            console.log('⚠️ 未拦截到显式 RPC 响应，继续执行深层隔离硬核验...');
+          }
 
-          // Playwright 原生点击辅助
-          try {
-            const locatorCard = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
-            if (await locatorCard.isVisible()) {
-              await locatorCard.click({ force: true, delay: 100 });
-            }
-          } catch (e) {}
-
-          console.log('⏳ 点击已派发，等待服务端 _serverFn RPC 处理 (10 秒)...');
-          await page.waitForTimeout(10000);
+          await page.waitForTimeout(6000);
           await forceDismissPopups(page);
 
-          // 核心硬核验：打开全新标签页向服务端拉取落地数据
-          console.log('🔍 正在启动跨上下文硬核验，核查真实入库倒计时...');
-          const verifyPage = await context.newPage();
-          await verifyPage.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          // 核心加固：创建完全独立的全新隔离 Context 进行真实数据库核验，杜绝前端内存污染
+          console.log('🔍 正在启动【独立会话沙盒 (完全独立 Context)】硬核验，核查真实数据库倒计时...');
+          const freshContext = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          });
+          const verifyPage = await freshContext.newPage();
+          
+          // 新会话先完成认证登录，确保获取完全纯净的服务端渲染数据
+          await verifyPage.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await forceDismissPopups(verifyPage);
+          await safeFill(verifyPage, verifyPage.locator('input[type="email"], input[name="email"]').first(), email, 'Email');
+          await safeFill(verifyPage, verifyPage.locator('input[type="password"], input[name="password"]').first(), password, 'Password');
+          await Promise.all([
+            verifyPage.waitForURL(url => !url.href.includes('/login'), { timeout: 30000 }),
+            verifyPage.locator('button:has-text("Sign in"), button[type="submit"]').first().click()
+          ]);
+
+          // 进入目标服务器读取未污染的真实数据库时间
+          await verifyPage.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
           await verifyPage.waitForTimeout(2000);
           await forceDismissPopups(verifyPage);
-
           await switchToBillingTab(verifyPage);
-          const verifyRenewBtn = verifyPage.locator('button:has-text("Renew now")').first();
-          await verifyRenewBtn.waitFor({ state: 'visible', timeout: 15000 });
-          await verifyPage.waitForTimeout(1000);
 
           const finalTimeData = await extractExpiryTime(verifyPage);
           const finalHours = finalTimeData ? finalTimeData.totalHours : remainHours;
           const finalStr = finalTimeData ? finalTimeData.raw : '未获取到';
-          await safeScreenshot(verifyPage, `screenshots/server-${sIndex}-final-verify.png`);
-          await verifyPage.close();
+          await safeScreenshot(verifyPage, `screenshots/server-${sIndex}-real-verified.png`);
+          
+          // 关闭隔离上下文
+          await freshContext.close();
 
-          console.log(`⏱️ 全新页面核验结果: 前序 ${remainHours.toFixed(1)}h ➔ 真实数据库时间: ${finalHours.toFixed(1)}h (${finalStr})`);
+          console.log(`⏱️ 独立沙盒真实入库核验结果: 前序 ${remainHours.toFixed(1)}h ➔ 真实数据库时间: ${finalHours.toFixed(1)}h (${finalStr})`);
 
+          // 只有真实数据增加了 20 小时以上才算入库
           if (finalHours > remainHours + 20) {
-            console.log('🎉 验证通过：后端数据库已落盘！');
+            console.log('🎉 验证通过：后端数据库已确认落盘！');
             reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${finalStr}</b>`);
           } else {
             console.error('❌ 验证失败：后端数据未真正更新！');
-            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期指令下发但后端未入账 (当前: ${finalStr})\n     └ 机制: 下个 12h 周期将自动重试`);
+            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期指令下发但后端未入账 (当前真实时间: ${finalStr})\n     └ 机制: 下个周期将自动重试`);
           }
 
         } else {
