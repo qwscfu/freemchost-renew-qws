@@ -47,7 +47,7 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 稳健清理干扰弹窗（彻底清除遮罩与淡出延迟）
+// 🛡️ 稳健清理干扰弹窗
 async function forceDismissPopups(page) {
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
@@ -62,7 +62,7 @@ async function forceDismissPopups(page) {
       if (await maybeLater.isVisible({ timeout: 400 })) {
         await maybeLater.click({ force: true });
         console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(400);
       }
     } catch (e) {}
   }
@@ -101,7 +101,6 @@ async function forceDismissPopups(page) {
         }
       });
 
-      // 彻底拔除干扰层遗留的 fixed 遮罩
       const backdrops = allEls.filter(el => 
         el?.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
       );
@@ -113,7 +112,7 @@ async function forceDismissPopups(page) {
     });
   } catch (e) {}
 
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(200);
 }
 
 // 模拟真实用户输入
@@ -328,75 +327,74 @@ async function safeScreenshot(page, filePath) {
 
           console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
           await forceDismissPopups(page);
-          await page.waitForTimeout(1200); // 留足时间彻底卸载遮罩动画
+          await page.waitForTimeout(1000); // 确保遮罩完全淡出
 
-          console.log('👉 准备发起【DOM 原生原型穿透 + 全层级物理鼠标击发】...');
+          console.log('👉 准备精准打击 [60 hours] 触发 _serverFn RPC...');
 
-          // 核心方案：在浏览器内部递归触发该卡片每一个交互层级
-          const triggerResult = await page.evaluate(() => {
-            const allEls = Array.from(document.querySelectorAll('*'));
-            
-            // 找到明确包含 60 hours 且包含 Discord 的卡片
-            const card = allEls.find(el => {
-              const t = el.textContent || '';
-              return t.includes('60 hours') && t.includes('Discord') && el.children.length > 0;
-            });
-
-            if (!card) return '未找到 60 hours 选项容器';
-
-            // 1. 获取内部所有可能承接点击的交互子节点 (input, button, radio, a, span)
-            const clickables = Array.from(card.querySelectorAll('input, button, [role="radio"], [role="button"], span, div'));
-            clickables.unshift(card); // 把容器自己也放进去
-
-            // 2. 依次派发原生事件
-            clickables.forEach(node => {
+          let rpcSuccessCaptured = false;
+          const rpcListener = async res => {
+            const req = res.request();
+            const url = res.url();
+            if (req.method() === 'POST' && url.includes('_serverFn') && res.status() === 200) {
               try {
-                HTMLElement.prototype.click.call(node);
-                node.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                node.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                const body = await res.text();
+                // 排除反馈与评分
+                if (!body.includes('feedback') && !body.includes('rating')) {
+                  rpcSuccessCaptured = true;
+                  console.log(`📡 确认捕获到核心 _serverFn 续期 RPC 响应: ${url}`);
+                }
               } catch (e) {}
+            }
+          };
+          page.on('response', rpcListener);
+
+          // 核心精简定位：找到真正代表 60 hours 卡片的实体容器
+          for (let attempt = 1; attempt <= 4; attempt++) {
+            console.log(`🎯 尝试击发 #${attempt}...`);
+            
+            await page.evaluate(() => {
+              const allEls = Array.from(document.querySelectorAll('*'));
+              const targetCard = allEls.find(el => {
+                const t = (el.innerText || '').trim();
+                return t.includes('60 hours') && t.includes('Discord') && el.children.length > 0;
+              });
+
+              if (targetCard) {
+                // 模拟人手聚焦并触发真实物理事件流
+                targetCard.focus();
+                const rect = targetCard.getBoundingClientRect();
+                const evtOpts = { bubbles: true, cancelable: true, view: window, clientX: rect.left + 50, clientY: rect.top + 20 };
+                targetCard.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
+                targetCard.dispatchEvent(new MouseEvent('mousedown', evtOpts));
+                targetCard.dispatchEvent(new MouseEvent('mouseup', evtOpts));
+                targetCard.click();
+              }
             });
 
-            // 3. 返回卡片物理几何中心以供后续鼠标补刀
-            const rect = card.getBoundingClientRect();
-            return {
-              success: true,
-              nodesCount: clickables.length,
-              x: rect.left + rect.width / 2,
-              y: rect.top + rect.height / 2
-            };
-          });
+            // 键盘确认补刀 (Enter / Space)
+            await page.keyboard.press('Enter');
+            await page.keyboard.press('Space');
 
-          console.log(`🖱️ DOM 穿透执行完毕，触发节点数: ${triggerResult.nodesCount || 0}`);
+            // 等待 2.5 秒核验发包
+            for (let w = 0; w < 5; w++) {
+              if (rpcSuccessCaptured) break;
+              await page.waitForTimeout(500);
+            }
 
-          if (triggerResult.x && triggerResult.y) {
-            // 用真实鼠标补刀点击文字区域（中心偏左上，避开空白区域）
-            console.log(`👆 真实物理鼠标补刀点击卡片核心文字区...`);
-            await page.mouse.move(triggerResult.x - 50, triggerResult.y - 10);
-            await page.waitForTimeout(100);
-            await page.mouse.down();
-            await page.waitForTimeout(150);
-            await page.mouse.up();
+            if (rpcSuccessCaptured) {
+              console.log('🎉 真实 _serverFn 续期请求已成功发送并确认！');
+              break;
+            }
+            
+            console.log('⚠️ 未检测到有效 RPC，尝试直接点击卡片文字区域补刀...');
+            try {
+              const txtEl = page.locator('text="60 hours"').last();
+              await txtEl.click({ force: true, delay: 100 });
+            } catch (e) {}
+            await page.waitForTimeout(1000);
           }
 
-          await page.waitForTimeout(1500);
-
-          // 核心二次提交：无论是否有额外按钮，全部触发一次确认
-          console.log('👉 检查并触发模态框最终确认按钮与键盘提交...');
-          await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('button, a'));
-            const submitBtn = btns.find(b => {
-              const t = (b.textContent || '').toLowerCase();
-              return (t.includes('extend') || t.includes('confirm') || t.includes('renew') || t.includes('continue')) && !t.includes('maybe later');
-            });
-            if (submitBtn) {
-              submitBtn.click();
-            }
-          });
-
-          await page.keyboard.press('Enter');
-          await page.keyboard.press('Space');
+          page.off('response', rpcListener);
 
           // 会话保温 30 秒，确保后端 Discord 异步校验与事务完全落库
           console.log('☕ 会话保温中：保持浏览器在线 30 秒，确保后端事务完全提交...');
@@ -407,7 +405,7 @@ async function safeScreenshot(page, filePath) {
 
           console.log('🔄 正在当前页面刷新以验证持久化状态...');
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(3000);
           await forceDismissPopups(page);
           await switchToBillingTab(page);
 
