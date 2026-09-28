@@ -325,50 +325,59 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
-          // 核心加固：点击前立即扫除再次弹出的打分/反馈弹窗
+          // 点击前再次扫除可能置顶的干扰弹窗
           console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
           await forceDismissPopups(page);
           await page.waitForTimeout(500);
 
-          console.log('👉 准备发起真实物理鼠标交互点击 [60 hours]...');
+          console.log('👉 准备发起高成功率多阶真实交互点击 [60 hours]...');
 
-          // 前置布设网络响应监听器，等待真实的 _serverFn RPC 响应
+          // 布设全域网络响应监听器，等待真实的 _serverFn / renew 响应
+          let rpcTriggered = false;
           const rpcPromise = page.waitForResponse(res => {
             const req = res.request();
             const url = res.url();
             return req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew'));
-          }, { timeout: 12000 }).catch(() => null);
+          }, { timeout: 10000 }).then(() => {
+            rpcTriggered = true;
+          }).catch(() => null);
 
-          // 直接定位 60 hours 卡片容器
-          const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
+          // 方式 1：直接定位包含 60 hours 且带有边框或圆角的交互卡片
+          const card = page.locator('div, button, a').filter({ hasText: /^60 hours/i, hasNotText: '14 days' }).last();
           
-          let clickedOk = false;
           try {
-            const box = await cardLocator.boundingBox({ timeout: 5000 });
-            if (box) {
-              await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-              await page.waitForTimeout(150);
-              await page.mouse.down();
-              await page.waitForTimeout(120);
-              await page.mouse.up();
-              clickedOk = true;
-              console.log('🖱️ 真实物理鼠标点击序列已触发！');
-            }
+            await card.hover({ timeout: 2000 });
+            await card.click({ force: true, delay: 100 });
+            console.log('🖱️ 阶梯点击 1: 直接对卡片触发 hover + click 完成！');
           } catch (e) {
-            console.log('⚠️ 鼠标坐标获取跳过，改用 DOM 级直接派发...');
+            console.log('⚠️ 阶梯 1 跳过，尝试文本直接点击...');
           }
 
-          if (!clickedOk) {
-            await cardLocator.click({ force: true, timeout: 5000 }).catch(() => {});
+          // 方式 2：如果 2 秒内未触发发包，直接命中文字节点本身
+          await page.waitForTimeout(1500);
+          if (!rpcTriggered) {
+            try {
+              const textNode = page.getByText('60 hours', { exact: false }).first();
+              await textNode.click({ force: true, delay: 80 });
+              console.log('🖱️ 阶梯点击 2: 对文字节点触发强制物理点击完成！');
+            } catch (e) {}
           }
 
-          // 辅助原生物理点击
-          await cardLocator.click({ force: true, delay: 50 }).catch(() => {});
+          // 方式 3：键盘激活兜底 (聚焦并按空格和回车)
+          await page.waitForTimeout(1000);
+          if (!rpcTriggered) {
+            try {
+              await page.keyboard.press('Tab');
+              await page.keyboard.press('Space');
+              await page.keyboard.press('Enter');
+              console.log('⌨️ 阶梯点击 3: 触发键盘快捷聚焦与激活！');
+            } catch (e) {}
+          }
 
           console.log('⏳ 等待服务端真实响应 (等待 _serverFn RPC 返回)...');
-          const rpcRes = await rpcPromise;
-          if (rpcRes) {
-            console.log(`📡 核心 RPC 接口已响应: ${rpcRes.url()} -> HTTP ${rpcRes.status()}`);
+          await rpcPromise;
+          if (rpcTriggered) {
+            console.log('📡 核心 RPC 接口已成功响应！');
           } else {
             console.log('⚠️ 未拦截到显式 RPC 响应，继续执行深层隔离硬核验...');
           }
