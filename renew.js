@@ -332,50 +332,61 @@ async function safeScreenshot(page, filePath) {
           console.log('👉 准备发起高成功率多阶真实交互点击 [60 hours]...');
 
           let rpcTriggered = false;
-          const rpcPromise = page.waitForResponse(res => {
+          page.on('response', res => {
             const req = res.request();
             const url = res.url();
-            return req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew'));
-          }, { timeout: 12000 }).then(() => {
-            rpcTriggered = true;
-          }).catch(() => null);
+            if (req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew')) && res.status() === 200) {
+              rpcTriggered = true;
+            }
+          });
 
-          const card = page.locator('div, button, a').filter({ hasText: /^60 hours/i, hasNotText: '14 days' }).last();
+          // 核心选择器：直接锁定包含 60 hours 且包含 Discord 的最内层卡片
+          const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).filter({ hasText: 'Discord' }).last();
           
-          try {
-            await card.hover({ timeout: 2000 });
-            await card.click({ force: true, delay: 100 });
-            console.log('🖱️ 阶梯点击 1: 直接对卡片触发 hover + click 完成！');
-          } catch (e) {
-            console.log('⚠️ 阶梯 1 跳过，尝试文本直接点击...');
-          }
-
-          await page.waitForTimeout(1500);
-          if (!rpcTriggered) {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            console.log(`🖱️ 正在执行交互尝试 #${attempt}...`);
             try {
-              const textNode = page.getByText('60 hours', { exact: false }).first();
-              await textNode.click({ force: true, delay: 80 });
-              console.log('🖱️ 阶梯点击 2: 对文字节点触发强制物理点击完成！');
+              if (await card.isVisible({ timeout: 2000 })) {
+                await card.scrollIntoViewIfNeeded();
+                await card.hover();
+                await page.waitForTimeout(100);
+                await card.click({ delay: 100 });
+              }
             } catch (e) {}
+
+            // 兜底：直接在卡片上触发真实的坐标点击
+            if (!rpcTriggered) {
+              try {
+                const box = await card.boundingBox();
+                if (box) {
+                  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                  await page.mouse.down();
+                  await page.waitForTimeout(120);
+                  await page.mouse.up();
+                }
+              } catch (e) {}
+            }
+
+            // 等待 2.5 秒看是否有网络响应包
+            for (let w = 0; w < 5; w++) {
+              if (rpcTriggered) break;
+              await page.waitForTimeout(500);
+            }
+
+            if (rpcTriggered) {
+              console.log('📡 核心 RPC 接口已成功响应 (HTTP 200)！');
+              break;
+            }
+            console.log('⚠️ 本次尝试尚未抓取到 RPC 响应，重试点击...');
           }
 
-          console.log('⏳ 等待服务端真实响应 (等待 _serverFn RPC 返回)...');
-          await rpcPromise;
-          if (rpcTriggered) {
-            console.log('📡 核心 RPC 接口已成功响应！');
-          } else {
-            console.log('⚠️ 未拦截到显式 RPC 响应，继续执行会话保温...');
-          }
-
-          // 核心优化 1：会话保温与异步持久化等待 (留出充分时间让 Discord 鉴权与后台事务提交落库)
+          // 核心优化：会话保温与异步持久化等待 (留出充分时间让 Discord 鉴权与后台事务提交落库)
           console.log('☕ 会话保温中：保持浏览器在线 30 秒，确保后端 Discord 异步校验与事务完全落库...');
           for (let warm = 0; warm < 6; warm++) {
             await page.waitForTimeout(5000);
-            // 顺带关闭可能浮出来的 Discord 邀请引导弹窗，模拟真实用户操作完毕
             await forceDismissPopups(page);
           }
 
-          // 核心优化 2：在当前会话内刷新页面，验证本页面数据是否已真正稳定落库
           console.log('🔄 正在当前页面刷新以验证持久化状态...');
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
           await page.waitForTimeout(2000);
@@ -423,8 +434,8 @@ async function safeScreenshot(page, filePath) {
             console.log('🎉 终审通过：后端数据库已稳定持久化，未发生回滚！');
             reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${finalStr}</b>`);
           } else {
-            console.error('❌ 终审失败：后端数据在等待后回滚（Discord 异步检验未通过或会话中断）！');
-            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期发生回滚，最终未生效 (当前: ${finalStr})\n     └ 建议: 登录官网检查该账号 Discord 角色与链接状态`);
+            console.error('❌ 终审失败：后端数据在等待后未加时！');
+            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期请求未完成入账 (当前: ${finalStr})\n     └ 机制: 下个周期将自动重试`);
           }
 
         } else {
