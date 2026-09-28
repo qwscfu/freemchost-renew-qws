@@ -101,6 +101,7 @@ async function forceDismissPopups(page) {
         }
       });
 
+      document.body.style.pointerEvents = 'auto';
       const backdrops = allEls.filter(el => 
         el?.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
       );
@@ -308,93 +309,57 @@ async function safeScreenshot(page, filePath) {
           await page.waitForTimeout(1500);
           await forceDismissPopups(page);
 
-          console.log('⏳ 等待 [60 hours] 选项解锁 (等待 3-5 秒后端校验)...');
+          console.log('⏳ 等待 [60 hours] 选项解锁与签名初始化 (等待 5 秒)...');
           const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
           await renewModal.waitFor({ state: 'visible', timeout: 10000 });
 
-          for (let poll = 0; poll < 10; poll++) {
-            const isReady = await page.evaluate(() => {
-              const text = document.body.innerText || '';
-              return !text.toLowerCase().includes('come back later');
-            });
-
-            if (isReady && poll >= 3) {
-              console.log(`✅ [60 hours] 选项状态已解锁！`);
-              break;
-            }
-            await page.waitForTimeout(1200);
-          }
-
-          console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
-          await forceDismissPopups(page);
-          await page.waitForTimeout(1000); // 确保遮罩完全淡出
-
-          console.log('👉 准备精准打击 [60 hours] 触发 _serverFn RPC...');
-
-          let rpcSuccessCaptured = false;
-          const rpcListener = async res => {
-            const req = res.request();
-            const url = res.url();
-            if (req.method() === 'POST' && url.includes('_serverFn') && res.status() === 200) {
-              try {
-                const body = await res.text();
-                // 排除反馈与评分
-                if (!body.includes('feedback') && !body.includes('rating')) {
-                  rpcSuccessCaptured = true;
-                  console.log(`📡 确认捕获到核心 _serverFn 续期 RPC 响应: ${url}`);
-                }
-              } catch (e) {}
-            }
-          };
-          page.on('response', rpcListener);
-
-          // 核心精简定位：找到真正代表 60 hours 卡片的实体容器
-          for (let attempt = 1; attempt <= 4; attempt++) {
-            console.log(`🎯 尝试击发 #${attempt}...`);
-            
-            await page.evaluate(() => {
-              const allEls = Array.from(document.querySelectorAll('*'));
-              const targetCard = allEls.find(el => {
-                const t = (el.innerText || '').trim();
-                return t.includes('60 hours') && t.includes('Discord') && el.children.length > 0;
-              });
-
-              if (targetCard) {
-                // 模拟人手聚焦并触发真实物理事件流
-                targetCard.focus();
-                const rect = targetCard.getBoundingClientRect();
-                const evtOpts = { bubbles: true, cancelable: true, view: window, clientX: rect.left + 50, clientY: rect.top + 20 };
-                targetCard.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
-                targetCard.dispatchEvent(new MouseEvent('mousedown', evtOpts));
-                targetCard.dispatchEvent(new MouseEvent('mouseup', evtOpts));
-                targetCard.click();
-              }
-            });
-
-            // 键盘确认补刀 (Enter / Space)
-            await page.keyboard.press('Enter');
-            await page.keyboard.press('Space');
-
-            // 等待 2.5 秒核验发包
-            for (let w = 0; w < 5; w++) {
-              if (rpcSuccessCaptured) break;
-              await page.waitForTimeout(500);
-            }
-
-            if (rpcSuccessCaptured) {
-              console.log('🎉 真实 _serverFn 续期请求已成功发送并确认！');
-              break;
-            }
-            
-            console.log('⚠️ 未检测到有效 RPC，尝试直接点击卡片文字区域补刀...');
-            try {
-              const txtEl = page.locator('text="60 hours"').last();
-              await txtEl.click({ force: true, delay: 100 });
-            } catch (e) {}
+          // 模拟真人停留（积累有效 dwell_ms，避开人机检测拦截）
+          for (let dwell = 0; dwell < 5; dwell++) {
+            await page.mouse.move(960 + dwell * 5, 540 + dwell * 5);
             await page.waitForTimeout(1000);
           }
 
-          page.off('response', rpcListener);
+          console.log('🛡️ 扫除可能遮挡的反馈评分弹窗...');
+          await forceDismissPopups(page);
+          await page.waitForTimeout(800);
+
+          // 核心网络监听：专门盯防确认加时的写库端点（798181797b）
+          let renewCommitted = false;
+          page.on('response', res => {
+            const url = res.url();
+            if (url.includes('798181797bd95a02dee916a26c18d3539a58152db8660e097ca48d7cdd8ee50c') && res.status() === 200) {
+              renewCommitted = true;
+              console.log('📡 成功捕获真实写库端点 [798181797b] 返回 HTTP 200！');
+            }
+          });
+
+          console.log('👉 正在激活并击发 [60 hours] 续期动作...');
+          const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).last();
+          
+          for (let step = 1; step <= 3; step++) {
+            console.log(`🖱️ 触发人机物理交互序列 #${step}...`);
+            try {
+              await card.scrollIntoViewIfNeeded();
+              await card.hover();
+              await page.waitForTimeout(200);
+              await card.click({ delay: 120 });
+              await page.keyboard.press('Enter');
+              await page.keyboard.press('Space');
+            } catch (e) {}
+
+            for (let w = 0; w < 6; w++) {
+              if (renewCommitted) break;
+              await page.waitForTimeout(500);
+            }
+
+            if (renewCommitted) {
+              console.log('🎉 真实写库发包确认完毕！');
+              break;
+            }
+            console.log('⚠️ 尚未捕捉到专属端点，尝试点击内部文字触发...');
+            await page.getByText('60 hours', { exact: false }).first().click({ force: true }).catch(() => {});
+            await page.waitForTimeout(1000);
+          }
 
           // 会话保温 30 秒，确保后端 Discord 异步校验与事务完全落库
           console.log('☕ 会话保温中：保持浏览器在线 30 秒，确保后端事务完全提交...');
