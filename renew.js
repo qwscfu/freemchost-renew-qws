@@ -47,7 +47,7 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 稳健清理干扰弹窗
+// 🛡️ 稳健清理干扰弹窗（彻底防空指针崩溃）
 async function forceDismissPopups(page) {
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
@@ -325,6 +325,11 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
+          // 核心加固：点击前立即扫除再次弹出的打分/反馈弹窗
+          console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
+          await forceDismissPopups(page);
+          await page.waitForTimeout(500);
+
           console.log('👉 准备发起真实物理鼠标交互点击 [60 hours]...');
 
           // 前置布设网络响应监听器，等待真实的 _serverFn RPC 响应
@@ -334,21 +339,27 @@ async function safeScreenshot(page, filePath) {
             return req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew'));
           }, { timeout: 12000 }).catch(() => null);
 
-          // 获取 60 hours 卡片容器
+          // 直接定位 60 hours 卡片容器
           const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
-          await cardLocator.scrollIntoViewIfNeeded();
-          const box = await cardLocator.boundingBox();
+          
+          let clickedOk = false;
+          try {
+            const box = await cardLocator.boundingBox({ timeout: 5000 });
+            if (box) {
+              await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+              await page.waitForTimeout(150);
+              await page.mouse.down();
+              await page.waitForTimeout(120);
+              await page.mouse.up();
+              clickedOk = true;
+              console.log('🖱️ 真实物理鼠标点击序列已触发！');
+            }
+          } catch (e) {
+            console.log('⚠️ 鼠标坐标获取跳过，改用 DOM 级直接派发...');
+          }
 
-          if (box) {
-            // 真实鼠标轨迹：移动 -> 悬停 -> 按下 -> 停留 -> 释放
-            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-            await page.waitForTimeout(150);
-            await page.mouse.down();
-            await page.waitForTimeout(120);
-            await page.mouse.up();
-            console.log('🖱️ 真实物理鼠标点击序列已触发！');
-          } else {
-            await cardLocator.click({ force: true });
+          if (!clickedOk) {
+            await cardLocator.click({ force: true, timeout: 5000 }).catch(() => {});
           }
 
           // 辅助原生物理点击
