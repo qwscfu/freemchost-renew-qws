@@ -327,48 +327,67 @@ async function safeScreenshot(page, filePath) {
 
           console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
           await forceDismissPopups(page);
-          await page.waitForTimeout(1000);
+          await page.waitForTimeout(800);
 
-          // 核心两段式提交：选择卡片 -> 触发最终确认
-          console.log('👉 步骤 1/2: 正在选择并激活 [60 hours] 选项卡...');
-          const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).filter({ hasText: 'Discord' }).last();
-          
-          await card.scrollIntoViewIfNeeded();
-          await card.hover();
-          await page.waitForTimeout(150);
-          await card.click({ delay: 100 });
-          console.log('👆 已物理点击选中 [60 hours] 卡片！');
-          await page.waitForTimeout(1000);
+          console.log('👉 准备发起物理坐标穿透点击 [60 hours] (杜绝定位超时)...');
 
-          console.log('👉 步骤 2/2: 正在寻找并触发最终确认续期按钮 (Commit Action)...');
-          let commitDone = false;
+          // 核心优化：直接在浏览器内部提取真实物理坐标，免除 Playwright 长链定位器判定卡死
+          const cardCoord = await page.evaluate(() => {
+            const allEls = Array.from(document.querySelectorAll('*'));
+            // 匹配弹窗内同时包含 60 hours 且包含 Discord 的节点
+            const target = allEls.find(el => {
+              const txt = el.textContent || '';
+              return txt.includes('60 hours') && txt.includes('Discord') && el.children.length > 0;
+            });
 
-          // 方式 A: 弹窗底部常有的确认/延长按钮 (Extend, Confirm, Renew, Continue)
-          const commitBtns = renewModal.locator('button').filter({ hasText: /extend|confirm|renew|continue|keep online/i });
-          const bCount = await commitBtns.count();
-          for (let b = 0; b < bCount; b++) {
-            const btn = commitBtns.nth(b);
-            if (await btn.isVisible() && await btn.isEnabled()) {
-              const bText = await btn.innerText();
-              // 排除关闭按钮或 Maybe later
-              if (!bText.includes('Maybe later') && !bText.includes('Cancel')) {
-                await btn.click({ force: true });
-                console.log(`🚀 成功点击模态框提交按钮: [${bText.replace(/\n/g, ' ')}]`);
-                commitDone = true;
-                break;
+            if (target) {
+              const rect = target.getBoundingClientRect();
+              if (rect.width > 20 && rect.height > 20) {
+                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
               }
             }
+
+            // 兜底找纯文本为 60 hours 的叶子节点
+            const leaf = allEls.find(el => el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === '60 hours');
+            if (leaf) {
+              const rect = leaf.getBoundingClientRect();
+              return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+            }
+
+            return null;
+          });
+
+          if (cardCoord) {
+            console.log(`🖱️ 命中真实屏幕坐标: (${Math.round(cardCoord.x)}, ${Math.round(cardCoord.y)})，发起物理点击！`);
+            await page.mouse.move(cardCoord.x, cardCoord.y);
+            await page.waitForTimeout(100);
+            await page.mouse.down();
+            await page.waitForTimeout(120);
+            await page.mouse.up();
+            await page.mouse.click(cardCoord.x, cardCoord.y);
+          } else {
+            console.log('⚠️ 未拿到坐标，使用宽松文本定位器保底点击...');
+            await page.getByText('60 hours', { exact: false }).first().click({ force: true }).catch(() => {});
           }
 
-          // 方式 B: 双击卡片或按回车键进行表单提交
-          if (!commitDone) {
-            console.log('⌨️ 未检测到独立提交按钮，执行双击与 Enter 键确认提交...');
-            await card.dblclick({ force: true }).catch(() => {});
-            await page.keyboard.press('Enter');
-            await page.keyboard.press('Space');
-          }
+          await page.waitForTimeout(1200);
 
-          // 监听并打印真实提交发包
+          // 核心二次确认：寻找底部弹窗可能存在的提交按钮并点击
+          console.log('👉 检查并触发模态框最终确认按钮...');
+          await page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button, a'));
+            const submitBtn = btns.find(b => {
+              const t = (b.textContent || '').toLowerCase();
+              return (t.includes('extend') || t.includes('confirm') || t.includes('renew') || t.includes('continue')) && !t.includes('maybe later');
+            });
+            if (submitBtn) {
+              submitBtn.click();
+            }
+          });
+
+          await page.keyboard.press('Enter');
+
+          console.log('⏳ 指令已全部下发，等待响应及网络沉淀 (3 秒)...');
           await page.waitForTimeout(3000);
           await forceDismissPopups(page);
 
