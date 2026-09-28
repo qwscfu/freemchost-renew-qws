@@ -325,24 +325,21 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
-          // 点击前再次扫除可能置顶的干扰弹窗
           console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
           await forceDismissPopups(page);
           await page.waitForTimeout(500);
 
           console.log('👉 准备发起高成功率多阶真实交互点击 [60 hours]...');
 
-          // 布设全域网络响应监听器，等待真实的 _serverFn / renew 响应
           let rpcTriggered = false;
           const rpcPromise = page.waitForResponse(res => {
             const req = res.request();
             const url = res.url();
             return req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew'));
-          }, { timeout: 10000 }).then(() => {
+          }, { timeout: 12000 }).then(() => {
             rpcTriggered = true;
           }).catch(() => null);
 
-          // 方式 1：直接定位包含 60 hours 且带有边框或圆角的交互卡片
           const card = page.locator('div, button, a').filter({ hasText: /^60 hours/i, hasNotText: '14 days' }).last();
           
           try {
@@ -353,7 +350,6 @@ async function safeScreenshot(page, filePath) {
             console.log('⚠️ 阶梯 1 跳过，尝试文本直接点击...');
           }
 
-          // 方式 2：如果 2 秒内未触发发包，直接命中文字节点本身
           await page.waitForTimeout(1500);
           if (!rpcTriggered) {
             try {
@@ -363,37 +359,41 @@ async function safeScreenshot(page, filePath) {
             } catch (e) {}
           }
 
-          // 方式 3：键盘激活兜底 (聚焦并按空格和回车)
-          await page.waitForTimeout(1000);
-          if (!rpcTriggered) {
-            try {
-              await page.keyboard.press('Tab');
-              await page.keyboard.press('Space');
-              await page.keyboard.press('Enter');
-              console.log('⌨️ 阶梯点击 3: 触发键盘快捷聚焦与激活！');
-            } catch (e) {}
-          }
-
           console.log('⏳ 等待服务端真实响应 (等待 _serverFn RPC 返回)...');
           await rpcPromise;
           if (rpcTriggered) {
             console.log('📡 核心 RPC 接口已成功响应！');
           } else {
-            console.log('⚠️ 未拦截到显式 RPC 响应，继续执行深层隔离硬核验...');
+            console.log('⚠️ 未拦截到显式 RPC 响应，继续执行会话保温...');
           }
 
-          await page.waitForTimeout(6000);
-          await forceDismissPopups(page);
+          // 核心优化 1：会话保温与异步持久化等待 (留出充分时间让 Discord 鉴权与后台事务提交落库)
+          console.log('☕ 会话保温中：保持浏览器在线 30 秒，确保后端 Discord 异步校验与事务完全落库...');
+          for (let warm = 0; warm < 6; warm++) {
+            await page.waitForTimeout(5000);
+            // 顺带关闭可能浮出来的 Discord 邀请引导弹窗，模拟真实用户操作完毕
+            await forceDismissPopups(page);
+          }
 
-          // 核心加固：创建完全独立的全新隔离 Context 进行真实数据库核验，杜绝前端内存污染
-          console.log('🔍 正在启动【独立会话沙盒 (完全独立 Context)】硬核验，核查真实数据库倒计时...');
+          // 核心优化 2：在当前会话内刷新页面，验证本页面数据是否已真正稳定落库
+          console.log('🔄 正在当前页面刷新以验证持久化状态...');
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.waitForTimeout(2000);
+          await forceDismissPopups(page);
+          await switchToBillingTab(page);
+
+          const immediateTimeData = await extractExpiryTime(page);
+          const immediateHours = immediateTimeData ? immediateTimeData.totalHours : remainHours;
+          console.log(`⏱️ 本会话刷新后时长: ${immediateTimeData ? immediateTimeData.raw : '未获取到'} (约 ${immediateHours.toFixed(1)}h)`);
+
+          // 核心加固：创建完全独立的全新隔离 Context 进行真实数据库终审核验
+          console.log('🔍 正在启动【独立会话沙盒 (完全独立 Context)】终审硬核验...');
           const freshContext = await browser.newContext({
             viewport: { width: 1920, height: 1080 },
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           });
           const verifyPage = await freshContext.newPage();
           
-          // 新会话先完成认证登录，确保获取完全纯净的服务端渲染数据
           await verifyPage.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
           await forceDismissPopups(verifyPage);
           await safeFill(verifyPage, verifyPage.locator('input[type="email"], input[name="email"]').first(), email, 'Email');
@@ -414,18 +414,17 @@ async function safeScreenshot(page, filePath) {
           const finalStr = finalTimeData ? finalTimeData.raw : '未获取到';
           await safeScreenshot(verifyPage, `screenshots/server-${sIndex}-real-verified.png`);
           
-          // 关闭隔离上下文
           await freshContext.close();
 
-          console.log(`⏱️ 独立沙盒真实入库核验结果: 前序 ${remainHours.toFixed(1)}h ➔ 真实数据库时间: ${finalHours.toFixed(1)}h (${finalStr})`);
+          console.log(`⏱️ 终审核验结果: 前序 ${remainHours.toFixed(1)}h ➔ 稳定落库时间: ${finalHours.toFixed(1)}h (${finalStr})`);
 
-          // 只有真实数据增加了 20 小时以上才算入库
+          // 严格判定：只有真实数据增加了 20 小时以上才算最终成功
           if (finalHours > remainHours + 20) {
-            console.log('🎉 验证通过：后端数据库已确认落盘！');
+            console.log('🎉 终审通过：后端数据库已稳定持久化，未发生回滚！');
             reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${finalStr}</b>`);
           } else {
-            console.error('❌ 验证失败：后端数据未真正更新！');
-            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期指令下发但后端未入账 (当前真实时间: ${finalStr})\n     └ 机制: 下个周期将自动重试`);
+            console.error('❌ 终审失败：后端数据在等待后回滚（Discord 异步检验未通过或会话中断）！');
+            reports.push(`🔴 <b>服务器 ${sIndex}</b>: 续期发生回滚，最终未生效 (当前: ${finalStr})\n     └ 建议: 登录官网检查该账号 Discord 角色与链接状态`);
           }
 
         } else {
