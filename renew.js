@@ -62,7 +62,7 @@ async function forceDismissPopups(page) {
       if (await maybeLater.isVisible({ timeout: 400 })) {
         await maybeLater.click({ force: true });
         console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(400);
       }
     } catch (e) {}
   }
@@ -325,62 +325,81 @@ async function safeScreenshot(page, filePath) {
             await page.waitForTimeout(1200);
           }
 
+          // 彻底扫除打分弹窗并等待动画卸载
           console.log('🛡️ 正在扫除遮挡续期选项的置顶评分/反馈弹窗...');
           await forceDismissPopups(page);
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(1000); // 确保弹窗淡出动画完全结束
 
-          console.log('👉 准备发起高成功率多阶真实交互点击 [60 hours]...');
+          console.log('👉 准备发起高精度真实交互点击 [60 hours]...');
 
-          let rpcTriggered = false;
-          page.on('response', res => {
+          // 核心加固：只监听打分弹窗彻底关闭之后发出的 RPC 响应
+          let renewSuccessReceived = false;
+          const rpcListener = async res => {
             const req = res.request();
             const url = res.url();
-            if (req.method() === 'POST' && (url.includes('_serverFn') || url.includes('/renew')) && res.status() === 200) {
-              rpcTriggered = true;
-            }
-          });
-
-          // 核心选择器：直接锁定包含 60 hours 且包含 Discord 的最内层卡片
-          const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).filter({ hasText: 'Discord' }).last();
-          
-          for (let attempt = 1; attempt <= 3; attempt++) {
-            console.log(`🖱️ 正在执行交互尝试 #${attempt}...`);
-            try {
-              if (await card.isVisible({ timeout: 2000 })) {
-                await card.scrollIntoViewIfNeeded();
-                await card.hover();
-                await page.waitForTimeout(100);
-                await card.click({ delay: 100 });
-              }
-            } catch (e) {}
-
-            // 兜底：直接在卡片上触发真实的坐标点击
-            if (!rpcTriggered) {
+            if (req.method() === 'POST' && url.includes('_serverFn') && res.status() === 200) {
               try {
-                const box = await card.boundingBox();
-                if (box) {
-                  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-                  await page.mouse.down();
-                  await page.waitForTimeout(120);
-                  await page.mouse.up();
+                const body = await res.text();
+                // 排除打分反馈相关的 response
+                if (!body.includes('feedback') && !body.includes('rating')) {
+                  renewSuccessReceived = true;
+                  console.log(`📡 捕获到续期专用核心 RPC 响应: ${url.substring(0, 70)}...`);
                 }
               } catch (e) {}
             }
+          };
+          page.on('response', rpcListener);
 
-            // 等待 2.5 秒看是否有网络响应包
-            for (let w = 0; w < 5; w++) {
-              if (rpcTriggered) break;
+          // 锁定弹窗内部包含 60 hours 的卡片容器
+          const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).filter({ hasText: 'Discord' }).last();
+          
+          for (let attempt = 1; attempt <= 4; attempt++) {
+            console.log(`🖱️ 正在执行交互尝试 #${attempt}...`);
+            
+            // 真实物理鼠标点击中心点
+            try {
+              const box = await card.boundingBox({ timeout: 2500 });
+              if (box) {
+                await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                await page.waitForTimeout(100);
+                await page.mouse.down();
+                await page.waitForTimeout(150);
+                await page.mouse.up();
+                console.log('👆 物理鼠标按下与释放完成！');
+              } else {
+                await card.click({ force: true });
+              }
+            } catch (e) {
+              await card.click({ force: true }).catch(() => {});
+            }
+
+            // 备选辅助：触发卡片子节点的直接点击
+            await page.evaluate(() => {
+              const allEls = Array.from(document.querySelectorAll('*'));
+              const target = allEls.find(el => el.textContent && el.textContent.includes('60 hours') && el.textContent.includes('Discord'));
+              if (target) {
+                target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+              }
+            });
+
+            // 等待 3 秒观察是否有续期发包
+            for (let w = 0; w < 6; w++) {
+              if (renewSuccessReceived) break;
               await page.waitForTimeout(500);
             }
 
-            if (rpcTriggered) {
-              console.log('📡 核心 RPC 接口已成功响应 (HTTP 200)！');
+            if (renewSuccessReceived) {
+              console.log('🎉 续期发包确认触发成功！');
               break;
             }
-            console.log('⚠️ 本次尝试尚未抓取到 RPC 响应，重试点击...');
+            console.log('⚠️ 本次尝试未捕获续期发包，正在重试点击...');
+            await forceDismissPopups(page);
+            await page.waitForTimeout(500);
           }
 
-          // 核心优化：会话保温与异步持久化等待 (留出充分时间让 Discord 鉴权与后台事务提交落库)
+          page.off('response', rpcListener);
+
+          // 会话保温 30 秒，确保异步事务完整提交
           console.log('☕ 会话保温中：保持浏览器在线 30 秒，确保后端 Discord 异步校验与事务完全落库...');
           for (let warm = 0; warm < 6; warm++) {
             await page.waitForTimeout(5000);
@@ -397,7 +416,7 @@ async function safeScreenshot(page, filePath) {
           const immediateHours = immediateTimeData ? immediateTimeData.totalHours : remainHours;
           console.log(`⏱️ 本会话刷新后时长: ${immediateTimeData ? immediateTimeData.raw : '未获取到'} (约 ${immediateHours.toFixed(1)}h)`);
 
-          // 核心加固：创建完全独立的全新隔离 Context 进行真实数据库终审核验
+          // 核心硬核验：独立全新 Context 隔离核验真实入库数据
           console.log('🔍 正在启动【独立会话沙盒 (完全独立 Context)】终审硬核验...');
           const freshContext = await browser.newContext({
             viewport: { width: 1920, height: 1080 },
@@ -414,7 +433,6 @@ async function safeScreenshot(page, filePath) {
             verifyPage.locator('button:has-text("Sign in"), button[type="submit"]').first().click()
           ]);
 
-          // 进入目标服务器读取未污染的真实数据库时间
           await verifyPage.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
           await verifyPage.waitForTimeout(2000);
           await forceDismissPopups(verifyPage);
@@ -429,7 +447,6 @@ async function safeScreenshot(page, filePath) {
 
           console.log(`⏱️ 终审核验结果: 前序 ${remainHours.toFixed(1)}h ➔ 稳定落库时间: ${finalHours.toFixed(1)}h (${finalStr})`);
 
-          // 严格判定：只有真实数据增加了 20 小时以上才算最终成功
           if (finalHours > remainHours + 20) {
             console.log('🎉 终审通过：后端数据库已稳定持久化，未发生回滚！');
             reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${finalStr}</b>`);
