@@ -59,7 +59,6 @@ async function cleanPopup(page) {
     await page.locator('input[type="email"]').fill(email);
     await page.locator('input[type="password"]').fill(password);
 
-    // 精准点击主登录按钮，避免与第三方登录冲突
     const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
     await Promise.all([
       page.waitForURL(url => !url.href.includes('/login'), { timeout: 30000 }),
@@ -88,7 +87,7 @@ async function cleanPopup(page) {
         const m = (document.body.innerText || '').match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
         return m ? `${m[1]}天${m[2]}小时${m[3]}分` : '未知';
       });
-      console.log(`⏱️ 操作前剩余时长: ${beforeTime}`);
+      console.log(`⏱️ 当前剩余时长: ${beforeTime}`);
 
       // 点击 Renew now 打开弹窗
       console.log('👉 点击 [Renew now]...');
@@ -97,33 +96,48 @@ async function cleanPopup(page) {
       await page.waitForTimeout(1500);
       await cleanPopup(page);
 
-      // 纯粹模拟真人点击 60 hours 卡片
-      console.log('👉 模拟真人点击 [60 hours] 选项框...');
+      // 检查 [60 hours] 选项
+      console.log('👉 检查 [60 hours] 选项框...');
       const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
-      await card.hover();
-      await page.waitForTimeout(300);
-      await card.click();
-      console.log('👆 已完成点击！');
 
-      // 等待 3 秒让网络通信完成
-      await page.waitForTimeout(3000);
-      await cleanPopup(page);
-
-      // 刷新页面查看最终结果
-      console.log('🔄 刷新页面核对结果...');
-      await page.reload({ waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(2000);
-      await cleanPopup(page);
-      await page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i }).first().click().catch(() => {});
-      await page.waitForTimeout(1000);
-
-      const afterTime = await page.evaluate(() => {
-        const m = (document.body.innerText || '').match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
-        return m ? `${m[1]}天${m[2]}小时${m[3]}分` : '未知';
+      // 判断选项是否处于可用状态（未被禁用且未显示冷却）
+      const canClick = await card.isEnabled({ timeout: 2000 }).catch(() => false);
+      const isLocked = await page.evaluate(() => {
+        const text = document.body.innerText || '';
+        return text.toLowerCase().includes('come back later');
       });
-      console.log(`⏱️ 最终时长: ${afterTime}`);
 
-      reports.push(`🖥️ <b>服务器 ${sIndex}</b>: ${beforeTime} ➔ <b>${afterTime}</b>`);
+      if (canClick && !isLocked) {
+        console.log('✅ 选项已解锁，模拟真人点击...');
+        await card.hover();
+        await page.waitForTimeout(300);
+        await card.click();
+        console.log('👆 已完成点击！');
+
+        // 等待 3 秒完成请求
+        await page.waitForTimeout(3000);
+        await cleanPopup(page);
+
+        // 刷新核对
+        console.log('🔄 刷新页面核对结果...');
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
+        await cleanPopup(page);
+        await page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i }).first().click().catch(() => {});
+        await page.waitForTimeout(1000);
+
+        const afterTime = await page.evaluate(() => {
+          const m = (document.body.innerText || '').match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
+          return m ? `${m[1]}天${m[2]}小时${m[3]}分` : '未知';
+        });
+        console.log(`⏱️ 最终时长: ${afterTime}`);
+        reports.push(`🖥️ <b>服务器 ${sIndex}</b>: 触发续期 (${beforeTime} ➔ <b>${afterTime}</b>)`);
+      } else {
+        console.log(`⏳ 选项当前处于置灰锁定状态（剩余时长 ${beforeTime} > 46h 或未解锁），无需点击。`);
+        // 顺手点 X 关掉弹窗
+        await page.locator('button:has-text("✕"), [aria-label="Close"], button:has-text("Close")').first().click().catch(() => {});
+        reports.push(`🖥️ <b>服务器 ${sIndex}</b>: 剩余 ${beforeTime} (未达续期门槛，保持等待)`);
+      }
     }
 
     const summary = `🤖 <b>FreeMCHost 巡检结果</b>\n\n${reports.join('\n')}\n\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
