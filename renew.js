@@ -272,14 +272,12 @@ async function safeScreenshot(page, filePath) {
         console.log('🗂️ 正在定位并点击 [PLAN Billing] 标签页...');
         await switchToBillingTab(page);
 
-        // 提取初始时间展示
         const timeData = await extractExpiryTime(page);
         const remainHours = timeData ? timeData.totalHours : 99;
         const remainStr = timeData ? timeData.raw : '未读取到';
         console.log(`⏱️ 服务器 [${sIndex}] 当前显示剩余时长: ${remainStr} (约 ${remainHours.toFixed(1)} 小时)`);
 
-        // 彻底取消一切时长限制！无条件开启弹窗并强力击发！
-        console.log(`🔥 【最高优先级】不管剩余多久，坚决打开续期弹窗强力狂点 [60 hours]！`);
+        console.log(`🔥 打开续期弹窗...`);
         const renewBtn = page.locator('button:has-text("Renew now")').first();
         await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
         await priorityDismissPopups(page);
@@ -289,17 +287,17 @@ async function safeScreenshot(page, filePath) {
         const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
         await renewModal.waitFor({ state: 'visible', timeout: 10000 });
 
-        // 模拟真人停留 4 秒，确保前端生成防脚本 Token 及 dwell_ms
-        console.log('⏳ 保持模态框焦点与悬停交互...');
-        for (let dwell = 0; dwell < 4; dwell++) {
+        // 核心修改：强制真实人类停留 10 秒，并平滑移动鼠标积攒 dwell_ms 突破前端防御
+        console.log('⏳ 核心人机防线突破：在弹窗内持续停留并移动光标 10 秒 (累积有效 dwell_ms 与签名)...');
+        for (let dwell = 0; dwell < 10; dwell++) {
           await priorityDismissPopups(page);
-          await page.mouse.move(960 + dwell * 5, 540 + dwell * 5);
+          await page.mouse.move(960 + Math.sin(dwell) * 60, 540 + Math.cos(dwell) * 40);
           await page.waitForTimeout(1000);
         }
 
         await priorityDismissPopups(page);
 
-        // 监听并捕获所有续期网络动作
+        // 监听续期网络响应
         let rpcTriggered = false;
         const rpcListener = async res => {
           const url = res.url();
@@ -308,56 +306,38 @@ async function safeScreenshot(page, filePath) {
               const text = await res.text();
               if (!text.includes('feedback') && !text.includes('rating')) {
                 rpcTriggered = true;
-                console.log(`📡 捕获到续期发包响应: ${url.substring(0, 70)}...`);
+                console.log(`📡 捕获到有效续期 RPC: ${url.substring(0, 70)}...`);
               }
             } catch (e) {}
           }
         };
         page.on('response', rpcListener);
 
-        console.log('👉 发动强力连点模式：直接对 [60 hours] 选项发起多层暴击点击！');
+        console.log('👉 触发真实物理点击 [60 hours]...');
         const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).last();
 
-        for (let burst = 1; burst <= 5; burst++) {
-          console.log(`💥 暴击点击第 #${burst} 轮...`);
+        for (let burst = 1; burst <= 3; burst++) {
           await priorityDismissPopups(page);
+          console.log(`💥 击发交互 #${burst}...`);
 
-          // 1. 卡片外层悬停与点击
           try {
-            await card.hover({ timeout: 1000 }).catch(() => {});
-            await card.click({ force: true, delay: 100 }).catch(() => {});
+            await card.hover({ timeout: 1000 });
+            await card.click({ delay: 100 });
           } catch (e) {}
 
-          // 2. 内部文本与单选框直接点击
-          try {
-            await page.getByText('60 hours', { exact: false }).first().click({ force: true, delay: 80 }).catch(() => {});
-            await page.getByText('Discord Boosted renewal', { exact: false }).first().click({ force: true, delay: 80 }).catch(() => {});
-          } catch (e) {}
-
-          // 3. 键盘回车与空格确认
           await page.keyboard.press('Enter');
           await page.keyboard.press('Space');
 
-          // 4. 寻找并猛点弹窗内可能存在的独立提交按钮
-          await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('button, a'));
-            btns.forEach(b => {
-              const t = (b.textContent || '').toLowerCase();
-              if ((t.includes('extend') || t.includes('confirm') || t.includes('renew') || t.includes('keep online')) && !t.includes('maybe later')) {
-                b.click();
-              }
-            });
-          });
-
-          await page.waitForTimeout(1000);
-          await priorityDismissPopups(page);
+          // 如果 2 秒内发出了包，直接退出
+          await page.waitForTimeout(2000);
+          if (rpcTriggered) break;
         }
 
         page.off('response', rpcListener);
 
-        // 会话保温 25 秒，让所有后续异步校验和数据库完全落库
-        console.log('☕ 会话保温中：保持浏览器在线 25 秒，等待后端写入及确认...');
-        for (let warm = 0; warm < 5; warm++) {
+        // 会话保温 15 秒
+        console.log('☕ 会话保温中：保持在线 15 秒等待后端写入...');
+        for (let warm = 0; warm < 3; warm++) {
           await page.waitForTimeout(5000);
           await priorityDismissPopups(page);
         }
@@ -368,8 +348,8 @@ async function safeScreenshot(page, filePath) {
         await priorityDismissPopups(page);
         await switchToBillingTab(page);
 
-        // 核心硬核验：完全独立的全新 Context 终审核验真实入库数据
-        console.log('🔍 正在启动【独立会话沙盒 (完全独立 Context)】终审硬核验...');
+        // 独立沙盒终审
+        console.log('🔍 正在启动【独立会话沙盒】硬核验...');
         const freshContext = await browser.newContext({
           viewport: { width: 1920, height: 1080 },
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -403,8 +383,8 @@ async function safeScreenshot(page, filePath) {
           console.log('🎉 终审通过：后端数据库已稳定入账！');
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${finalStr}</b>`);
         } else {
-          console.log('⚠️ 终审提示：本次强力击发已完成，时间保持未变（可能处于后端存量封顶中）。');
-          reports.push(`🟡 <b>服务器 ${sIndex}</b>: 已强制发起 5 轮暴击点击 (当前: ${finalStr})\n     └ 状态: 持续监测下个周期`);
+          console.log('⚠️ 时间暂未变动。');
+          reports.push(`🟡 <b>服务器 ${sIndex}</b>: 已强制发起点击 (当前: ${finalStr})\n     └ 状态: 持续监测下个周期`);
         }
 
       } catch (innerErr) {
@@ -415,7 +395,7 @@ async function safeScreenshot(page, filePath) {
     }
 
     // 汇总推送 Telegram 报告
-    const summaryMsg = `🤖 <b>FreeMCHost 强制巡检报告</b>\n\n${reports.join('\n')}\n\n<b>策略:</b> 最高优先级强制连击续期\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
+    const summaryMsg = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
     await sendTelegramMessage(tgToken, tgChatId, summaryMsg);
 
   } catch (error) {
