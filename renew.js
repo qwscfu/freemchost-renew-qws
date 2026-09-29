@@ -58,9 +58,12 @@ async function cleanPopup(page) {
 
     await page.locator('input[type="email"]').fill(email);
     await page.locator('input[type="password"]').fill(password);
+
+    // 精准点击主登录按钮，避免与第三方登录冲突
+    const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
     await Promise.all([
       page.waitForURL(url => !url.href.includes('/login'), { timeout: 30000 }),
-      page.locator('button:has-text("Sign in")').click()
+      signInBtn.click()
     ]);
     console.log('✅ 登录成功！');
 
@@ -94,7 +97,7 @@ async function cleanPopup(page) {
       await page.waitForTimeout(1500);
       await cleanPopup(page);
 
-      // 简单、纯粹地模拟真人点击 60 hours 卡片
+      // 纯粹模拟真人点击 60 hours 卡片
       console.log('👉 模拟真人点击 [60 hours] 选项框...');
       const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
       await card.hover();
