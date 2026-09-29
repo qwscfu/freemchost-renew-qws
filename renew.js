@@ -287,52 +287,82 @@ async function safeScreenshot(page, filePath) {
         const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
         await renewModal.waitFor({ state: 'visible', timeout: 10000 });
 
-        // 核心修改：强制真实人类停留 10 秒，并平滑移动鼠标积攒 dwell_ms 突破前端防御
-        console.log('⏳ 核心人机防线突破：在弹窗内持续停留并移动光标 10 秒 (累积有效 dwell_ms 与签名)...');
-        for (let dwell = 0; dwell < 10; dwell++) {
+        // 积累有效 dwell_ms
+        console.log('⏳ 在弹窗内持续停留 6 秒，积累行为计时...');
+        for (let dwell = 0; dwell < 6; dwell++) {
           await priorityDismissPopups(page);
-          await page.mouse.move(960 + Math.sin(dwell) * 60, 540 + Math.cos(dwell) * 40);
+          await page.mouse.move(960 + dwell * 5, 540 + dwell * 5);
           await page.waitForTimeout(1000);
         }
 
         await priorityDismissPopups(page);
 
-        // 监听续期网络响应
+        // 监听并实时打印发包情况
         let rpcTriggered = false;
         const rpcListener = async res => {
           const url = res.url();
-          if (url.includes('_serverFn') && res.status() === 200) {
+          if (url.includes('_serverFn')) {
             try {
               const text = await res.text();
               if (!text.includes('feedback') && !text.includes('rating')) {
                 rpcTriggered = true;
-                console.log(`📡 捕获到有效续期 RPC: ${url.substring(0, 70)}...`);
+                console.log(`📡 抓取到关键 RPC: ${url.substring(0, 60)} -> 状态: ${res.status()} -> 内容: ${text.substring(0, 100)}`);
               }
             } catch (e) {}
           }
         };
         page.on('response', rpcListener);
 
-        console.log('👉 触发真实物理点击 [60 hours]...');
-        const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).last();
+        console.log('👉 发起【选中单选框 + 触发提交】组合操作...');
 
-        for (let burst = 1; burst <= 3; burst++) {
-          await priorityDismissPopups(page);
-          console.log(`💥 击发交互 #${burst}...`);
+        // 1. 滚动弹窗内部，确保 60 hours 完全进入视口并精准定位单选框
+        const card = renewModal.locator('div, button, label').filter({ hasText: '60 hours' }).last();
+        await card.scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(300);
 
-          try {
-            await card.hover({ timeout: 1000 });
-            await card.click({ delay: 100 });
-          } catch (e) {}
+        // 点击卡片及其内部所有可能的点击目标 (单选圆圈、图标、文本)
+        try {
+          const box = await card.boundingBox();
+          if (box) {
+            // 点击左侧圆圈区域 (左侧 25px 处通常是单选按钮)
+            await page.mouse.click(box.x + 25, box.y + box.height / 2);
+            await page.waitForTimeout(200);
+            // 点击中心
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          }
+        } catch (e) {}
 
-          await page.keyboard.press('Enter');
-          await page.keyboard.press('Space');
+        await card.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(500);
 
-          // 如果 2 秒内发出了包，直接退出
-          await page.waitForTimeout(2000);
-          if (rpcTriggered) break;
-        }
+        // 2. 深入模态框底部寻找独立的“提交/确认”按钮
+        console.log('🔍 正在寻找并击发弹窗底部提交按钮...');
+        await page.evaluate(() => {
+          // 找到 Keep your server online 模态框
+          const modals = Array.from(document.querySelectorAll('div')).filter(d => (d.innerText || '').includes('Keep your server online'));
+          const currentModal = modals[modals.length - 1];
+          if (!currentModal) return;
 
+          // 滚动模态框到底部
+          currentModal.scrollTop = currentModal.scrollHeight;
+
+          // 检索所有可提交或激活的元素
+          const candidates = Array.from(currentModal.querySelectorAll('button, [role="button"], [type="submit"], input[type="submit"]'));
+          candidates.forEach(btn => {
+            const txt = (btn.textContent || '').trim().toLowerCase();
+            // 排除关闭、取消、打分
+            if (!txt.includes('maybe later') && !txt.includes('cancel') && !txt.includes('close') && txt.length > 0) {
+              btn.click();
+            }
+          });
+        });
+
+        // 3. 键盘回车与空格兜底提交
+        await page.keyboard.press('Enter');
+        await page.keyboard.press('Space');
+
+        // 等待 3 秒观察网络发包
+        await page.waitForTimeout(3000);
         page.off('response', rpcListener);
 
         // 会话保温 15 秒
@@ -348,7 +378,7 @@ async function safeScreenshot(page, filePath) {
         await priorityDismissPopups(page);
         await switchToBillingTab(page);
 
-        // 独立沙盒终审
+        // 独立沙盒硬核验
         console.log('🔍 正在启动【独立会话沙盒】硬核验...');
         const freshContext = await browser.newContext({
           viewport: { width: 1920, height: 1080 },
@@ -395,7 +425,7 @@ async function safeScreenshot(page, filePath) {
     }
 
     // 汇总推送 Telegram 报告
-    const summaryMsg = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
+    const summaryMsg = `🤖 <b>FreeMCHost 强制巡检报告</b>\n\n${reports.join('\n')}\n\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
     await sendTelegramMessage(tgToken, tgChatId, summaryMsg);
 
   } catch (error) {
