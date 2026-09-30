@@ -59,7 +59,7 @@ async function getRealListTimes(page) {
 
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
     proxy: proxyUrl ? { server: proxyUrl } : undefined
   });
 
@@ -73,16 +73,38 @@ async function getRealListTimes(page) {
   try {
     console.log('🚀 正在登录...');
     await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1500);
     await cleanPopup(page);
 
-    await page.locator('input[type="email"]').fill(email);
-    await page.locator('input[type="password"]').fill(password);
+    // 稳定键入账号密码
+    const emailInput = page.locator('input[type="email"]').first();
+    await emailInput.click();
+    await emailInput.fill(email);
+
+    const passInput = page.locator('input[type="password"]').first();
+    await passInput.click();
+    await passInput.fill(password);
+    await page.waitForTimeout(300);
 
     const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
-    await Promise.all([
-      page.waitForURL(url => !url.href.includes('/login'), { timeout: 30000 }),
-      signInBtn.click()
-    ]);
+    await signInBtn.click();
+
+    // 循环核验是否完成登录跳转，兼容网络延迟
+    let loggedIn = false;
+    for (let wait = 0; wait < 15; wait++) {
+      await page.waitForTimeout(1000);
+      const curUrl = page.url();
+      if (!curUrl.includes('/login')) {
+        loggedIn = true;
+        break;
+      }
+      // 如果还在登录页，顺手清理干扰弹窗并重新轻点一下提交
+      await cleanPopup(page);
+    }
+
+    if (!loggedIn) {
+      throw new Error('登录未跳转，可能密码错误或被验证码拦截');
+    }
     console.log('✅ 登录成功！');
 
     for (let i = 0; i < serverUrls.length; i++) {
@@ -132,12 +154,12 @@ async function getRealListTimes(page) {
         await card.click();
         console.log('👆 已完成点击！');
 
-        // 关键改动 1：等待 6 秒，确保后端的异步入库事务处理完毕
+        // 等待 6 秒确保后端提交完成
         console.log('⏳ 等待后端数据库提交事务 (6 秒)...');
         await page.waitForTimeout(6000);
         await cleanPopup(page);
 
-        // 关键改动 2：强制回到总览列表页（/app/servers），读取真实的数据库时间（杜绝单页乐观缓存）
+        // 返回总览列表页（/app/servers），读取真实的数据库时间
         console.log('🔍 返回服务器列表页核实最终真实时长...');
         await page.goto('https://freemchost.com/app/servers', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(3000);
@@ -146,7 +168,7 @@ async function getRealListTimes(page) {
         const realList = await getRealListTimes(page);
         console.log('📋 当前列表页各服务器最新真实时间:', JSON.stringify(realList));
 
-        // 关键改动 3：防止连续加时触发同账号并发锁，在进入下一台服务器前强制缓冲 8 秒
+        // 避免同账号请求过于密集触发后端锁，冷却 8 秒
         if (i < serverUrls.length - 1) {
           console.log('☕ 避免同账号连续请求触发后端并发锁，安全冷却 8 秒...');
           await page.waitForTimeout(8000);
