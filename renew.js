@@ -76,7 +76,6 @@ async function getRealListTimes(page) {
     await page.waitForTimeout(1500);
     await cleanPopup(page);
 
-    // 稳定键入账号密码
     const emailInput = page.locator('input[type="email"]').first();
     await emailInput.click();
     await emailInput.fill(email);
@@ -89,7 +88,6 @@ async function getRealListTimes(page) {
     const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
     await signInBtn.click();
 
-    // 循环核验是否完成登录跳转，兼容网络延迟
     let loggedIn = false;
     for (let wait = 0; wait < 15; wait++) {
       await page.waitForTimeout(1000);
@@ -98,7 +96,6 @@ async function getRealListTimes(page) {
         loggedIn = true;
         break;
       }
-      // 如果还在登录页，顺手清理干扰弹窗并重新轻点一下提交
       await cleanPopup(page);
     }
 
@@ -113,14 +110,15 @@ async function getRealListTimes(page) {
       console.log(`\n================= 正在处理服务器 [${sIndex}/${serverUrls.length}] =================`);
 
       await page.goto(url, { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 点 PLAN Billing 标签页
-      console.log('👉 切换至 Billing 页面...');
-      const billingTab = page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i }).first();
-      await billingTab.click();
-      await page.waitForTimeout(1500);
+      // 精准定位服务器内的 PLAN Billing 标签页，排除全局导航里的 /app/billing
+      console.log('👉 切换至 PLAN Billing 页面...');
+      const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
+      await billingTab.scrollIntoViewIfNeeded().catch(() => {});
+      await billingTab.click({ force: true });
+      await page.waitForTimeout(2000);
       await cleanPopup(page);
 
       // 读取当前时间
@@ -133,7 +131,8 @@ async function getRealListTimes(page) {
       // 点击 Renew now 打开弹窗
       console.log('👉 点击 [Renew now]...');
       const renewNowBtn = page.locator('button:has-text("Renew now")').first();
-      await renewNowBtn.click();
+      await renewNowBtn.waitFor({ state: 'visible', timeout: 10000 });
+      await renewNowBtn.click({ force: true });
       await page.waitForTimeout(1500);
       await cleanPopup(page);
 
@@ -151,15 +150,14 @@ async function getRealListTimes(page) {
         console.log('✅ 选项已解锁，模拟真人点击...');
         await card.hover();
         await page.waitForTimeout(300);
-        await card.click();
+        await card.click({ force: true });
         console.log('👆 已完成点击！');
 
-        // 等待 6 秒确保后端提交完成
         console.log('⏳ 等待后端数据库提交事务 (6 秒)...');
         await page.waitForTimeout(6000);
         await cleanPopup(page);
 
-        // 返回总览列表页（/app/servers），读取真实的数据库时间
+        // 返回总览列表页（/app/servers），读取真实入库时间
         console.log('🔍 返回服务器列表页核实最终真实时长...');
         await page.goto('https://freemchost.com/app/servers', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(3000);
@@ -168,7 +166,6 @@ async function getRealListTimes(page) {
         const realList = await getRealListTimes(page);
         console.log('📋 当前列表页各服务器最新真实时间:', JSON.stringify(realList));
 
-        // 避免同账号请求过于密集触发后端锁，冷却 8 秒
         if (i < serverUrls.length - 1) {
           console.log('☕ 避免同账号连续请求触发后端并发锁，安全冷却 8 秒...');
           await page.waitForTimeout(8000);
