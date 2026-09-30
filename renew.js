@@ -16,12 +16,31 @@ async function sendTG(botToken, chatId, text) {
 async function cleanPopup(page) {
   try {
     const later = page.locator('text="Maybe later"').first();
-    if (await later.isVisible({ timeout: 300 })) {
+    if (await later.isVisible({ timeout: 200 })) {
       await later.click();
       console.log('🛡️ 顺手关闭了 Maybe later 弹窗');
       await page.waitForTimeout(300);
     }
   } catch (e) {}
+}
+
+// 在列表页直接读取真实时长（避开单页内的乐观假缓存）
+async function getRealListTimes(page) {
+  return await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll('div')).filter(d => 
+      (d.innerText || '').includes('EXPIRES IN') && (d.innerText || '').includes('fmc')
+    );
+    const map = {};
+    cards.forEach(c => {
+      const txt = c.innerText || '';
+      const nameMatch = txt.match(/fmc\d+/i);
+      const timeMatch = txt.match(/EXPIRES IN\s*([\dd\s:hm]+)/i);
+      if (nameMatch && timeMatch) {
+        map[nameMatch[0].toLowerCase()] = timeMatch[1].trim();
+      }
+    });
+    return map;
+  });
 }
 
 (async () => {
@@ -87,7 +106,7 @@ async function cleanPopup(page) {
         const m = (document.body.innerText || '').match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
         return m ? `${m[1]}天${m[2]}小时${m[3]}分` : '未知';
       });
-      console.log(`⏱️ 当前剩余时长: ${beforeTime}`);
+      console.log(`⏱️ 操作前剩余时长: ${beforeTime}`);
 
       // 点击 Renew now 打开弹窗
       console.log('👉 点击 [Renew now]...');
@@ -100,7 +119,6 @@ async function cleanPopup(page) {
       console.log('👉 检查 [60 hours] 选项框...');
       const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
 
-      // 判断选项是否处于可用状态（未被禁用且未显示冷却）
       const canClick = await card.isEnabled({ timeout: 2000 }).catch(() => false);
       const isLocked = await page.evaluate(() => {
         const text = document.body.innerText || '';
@@ -114,29 +132,31 @@ async function cleanPopup(page) {
         await card.click();
         console.log('👆 已完成点击！');
 
-        // 等待 3 秒完成请求
+        // 关键改动 1：等待 6 秒，确保后端的异步入库事务处理完毕
+        console.log('⏳ 等待后端数据库提交事务 (6 秒)...');
+        await page.waitForTimeout(6000);
+        await cleanPopup(page);
+
+        // 关键改动 2：强制回到总览列表页（/app/servers），读取真实的数据库时间（杜绝单页乐观缓存）
+        console.log('🔍 返回服务器列表页核实最终真实时长...');
+        await page.goto('https://freemchost.com/app/servers', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(3000);
         await cleanPopup(page);
 
-        // 刷新核对
-        console.log('🔄 刷新页面核对结果...');
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(2000);
-        await cleanPopup(page);
-        await page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i }).first().click().catch(() => {});
-        await page.waitForTimeout(1000);
+        const realList = await getRealListTimes(page);
+        console.log('📋 当前列表页各服务器最新真实时间:', JSON.stringify(realList));
 
-        const afterTime = await page.evaluate(() => {
-          const m = (document.body.innerText || '').match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
-          return m ? `${m[1]}天${m[2]}小时${m[3]}分` : '未知';
-        });
-        console.log(`⏱️ 最终时长: ${afterTime}`);
-        reports.push(`🖥️ <b>服务器 ${sIndex}</b>: 触发续期 (${beforeTime} ➔ <b>${afterTime}</b>)`);
+        // 关键改动 3：防止连续加时触发同账号并发锁，在进入下一台服务器前强制缓冲 8 秒
+        if (i < serverUrls.length - 1) {
+          console.log('☕ 避免同账号连续请求触发后端并发锁，安全冷却 8 秒...');
+          await page.waitForTimeout(8000);
+        }
+
+        reports.push(`🖥️ <b>服务器 ${sIndex}</b>: 触发续期，当前各机实时状态: ${JSON.stringify(realList)}`);
       } else {
-        console.log(`⏳ 选项当前处于置灰锁定状态（剩余时长 ${beforeTime} > 46h 或未解锁），无需点击。`);
-        // 顺手点 X 关掉弹窗
+        console.log(`⏳ 选项处于置灰状态（剩余 ${beforeTime} > 46h），无需点击。`);
         await page.locator('button:has-text("✕"), [aria-label="Close"], button:has-text("Close")').first().click().catch(() => {});
-        reports.push(`🖥️ <b>服务器 ${sIndex}</b>: 剩余 ${beforeTime} (未达续期门槛，保持等待)`);
+        reports.push(`🖥️ <b>服务器 ${sIndex}</b>: 剩余 ${beforeTime} (保持等待)`);
       }
     }
 
