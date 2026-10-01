@@ -24,13 +24,13 @@ async function cleanPopup(page) {
   } catch (e) {}
 }
 
-// 格式化时长字符串，清洗掉多余的换行与空格
+// 格式化时长字符串
 function formatTimeString(raw) {
   if (!raw) return '未知';
   return raw.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// 在列表页直接读取真实时长（避开单页内的乐观假缓存）
+// 在列表页直接读取真实时长
 async function getRealListTimes(page) {
   return await page.evaluate(() => {
     const cards = Array.from(document.querySelectorAll('div')).filter(d => 
@@ -42,7 +42,6 @@ async function getRealListTimes(page) {
       const nameMatch = txt.match(/fmc\d+/i);
       const timeMatch = txt.match(/EXPIRES IN\s*([\dd\s:hm]+)/i);
       if (nameMatch && timeMatch) {
-        // 清洗提取文本内的换行符
         const cleanVal = timeMatch[1].replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
         map[nameMatch[0].toLowerCase()] = cleanVal;
       }
@@ -71,11 +70,12 @@ async function getRealListTimes(page) {
     proxy: proxyUrl ? { server: proxyUrl } : undefined
   });
 
-  const page = await browser.newPage({
+  const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
   });
 
+  const page = await context.newPage();
   let reports = [];
 
   try {
@@ -145,6 +145,14 @@ async function getRealListTimes(page) {
       await page.waitForTimeout(1500);
       await cleanPopup(page);
 
+      // 核心延迟防线：在弹窗展开后耐心等待 8 秒，确保所有前置选项接口响应就绪并累积行为时间
+      console.log('⏳ 核心延迟缓冲：保持弹窗停留 8 秒，等待选项完全读取与防刷签名生成...');
+      for (let sec = 0; sec < 8; sec++) {
+        await cleanPopup(page);
+        await page.mouse.move(960 + sec * 5, 540 + sec * 3);
+        await page.waitForTimeout(1000);
+      }
+
       // 检查 [60 hours] 选项
       console.log('👉 检查 [60 hours] 选项框...');
       const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
@@ -156,44 +164,62 @@ async function getRealListTimes(page) {
       });
 
       if (canClick && !isLocked) {
-        console.log('✅ 选项已解锁，模拟真人点击...');
+        console.log('✅ 选项已处于可点击就绪状态，模拟真人点击...');
         await card.hover();
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(400);
         await card.click({ force: true });
         console.log('👆 已完成点击！');
 
-        console.log('⏳ 等待后端数据库提交事务 (6 秒)...');
-        await page.waitForTimeout(6000);
+        console.log('⏳ 等待后端数据库提交事务 (8 秒)...');
+        await page.waitForTimeout(8000);
         await cleanPopup(page);
 
-        // 返回总览列表页（/app/servers），读取真实入库时间
-        console.log('🔍 返回服务器列表页核实最终真实时长...');
-        await page.goto('https://freemchost.com/app/servers', { waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(3000);
-        await cleanPopup(page);
-
-        const realList = await getRealListTimes(page);
-        console.log('📋 当前列表页各服务器最新真实时间:', JSON.stringify(realList));
-
-        // 格式化当前服务器对应的最新时间
-        const serverKey = `fmc0${sIndex}`.toLowerCase();
-        const afterTime = realList[serverKey] || '已刷新入账';
-
+        // 如果有多台机器，在处理下一台前进行安全冷却，防止同账号并发冲突
         if (i < serverUrls.length - 1) {
-          console.log('☕ 避免同账号连续请求触发后端并发锁，安全冷却 8 秒...');
+          console.log('☕ 安全冷却 8 秒，防止同账号并发频控...');
           await page.waitForTimeout(8000);
         }
 
-        reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 (+60h)\n     └ 状态: ${beforeTime} ➔ <b>${afterTime}</b>`);
+        reports.push(`🟢 <b>服务器 ${sIndex}</b>: 已触发点击 (+60h) [前序: ${beforeTime}]`);
       } else {
-        console.log(`⏳ 选项处于置灰状态（剩余 ${beforeTime} > 46h），无需点击。`);
+        console.log(`⏳ 选项处于置灰锁定状态（剩余 ${beforeTime} > 46h），无需点击。`);
         await page.locator('button:has-text("✕"), [aria-label="Close"], button:has-text("Close")').first().click().catch(() => {});
         reports.push(`⚪ <b>服务器 ${sIndex}</b>: 剩余 <b>${beforeTime}</b> (安全充足，保持等待)`);
       }
     }
 
-    // 格式化 Telegram 报告输出
-    const summary = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n\n')}\n\n<b>检查策略:</b> 剩余低于 46h 时自动激活 +60h 续期\n<b>更新时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
+    // 终审核验：关闭操作上下文，新建干净的独立 Context 重新拉取列表页，杜绝前端内存假缓存
+    console.log('\n🔍 正在使用全新隔离会话拉取最终真实的后端数据库数据...');
+    const verifyContext = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    });
+    const verifyPage = await verifyContext.newPage();
+
+    await verifyPage.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded' });
+    await cleanPopup(verifyPage);
+    await verifyPage.locator('input[type="email"]').first().fill(email);
+    await verifyPage.locator('input[type="password"]').first().fill(password);
+    await verifyPage.locator('button[type="submit"]:has-text("Sign in")').first().click();
+    await verifyPage.waitForTimeout(3000);
+
+    await verifyPage.goto('https://freemchost.com/app/servers', { waitUntil: 'domcontentloaded' });
+    await verifyPage.waitForTimeout(3000);
+    await cleanPopup(verifyPage);
+
+    const finalRealMap = await getRealListTimes(verifyPage);
+    console.log('📋 数据库最终真实存留时间:', JSON.stringify(finalRealMap));
+    await verifyContext.close();
+
+    // 汇总真实的格式化报告
+    let finalReportLines = [];
+    for (let k = 0; k < serverUrls.length; k++) {
+      const sKey = `fmc0${k + 1}`.toLowerCase();
+      const realTime = finalRealMap[sKey] || '读取失败';
+      finalReportLines.push(`🖥️ <b>服务器 ${k + 1} (${sKey})</b>: 实际存留 ➔ <b>${realTime}</b>`);
+    }
+
+    const summary = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>真实入库核验:</b>\n${finalReportLines.join('\n')}\n\n<b>更新时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
     await sendTG(tgToken, tgChatId, summary);
 
   } catch (err) {
