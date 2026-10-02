@@ -24,29 +24,45 @@ async function cleanPopup(page) {
   } catch (e) {}
 }
 
-// 格式化时长字符串
+// 格式化时长字符串，清洗掉多余的换行与空格
 function formatTimeString(raw) {
   if (!raw) return '未知';
   return raw.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// 在列表页直接读取真实时长
-async function getRealListTimes(page) {
+// 从当前页面精确提取倒计时（优先从专用容器提取）
+async function extractExpiryTime(page) {
   return await page.evaluate(() => {
-    const cards = Array.from(document.querySelectorAll('div')).filter(d => 
-      (d.innerText || '').includes('EXPIRES IN') && (d.innerText || '').includes('fmc')
-    );
-    const map = {};
-    cards.forEach(c => {
-      const txt = c.innerText || '';
-      const nameMatch = txt.match(/fmc\d+/i);
-      const timeMatch = txt.match(/EXPIRES IN\s*([\dd\s:hm]+)/i);
-      if (nameMatch && timeMatch) {
-        const cleanVal = timeMatch[1].replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
-        map[nameMatch[0].toLowerCase()] = cleanVal;
+    // 方案 1: 从 TIME UNTIL EXPIRY 下方卡片精准提取
+    const allEls = Array.from(document.querySelectorAll('*'));
+    const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
+    if (header) {
+      let container = header.parentElement;
+      for (let k = 0; k < 4; k++) {
+        if (container) {
+          const txt = container.innerText || '';
+          const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
+          if (m) {
+            const d = parseInt(m[1], 10);
+            const h = parseInt(m[2], 10);
+            const min = parseInt(m[3], 10);
+            return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+          }
+          container = container.parentElement;
+        }
       }
-    });
-    return map;
+    }
+
+    // 方案 2: 全局正则兜底匹配
+    const bodyText = document.body.innerText || '';
+    const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
+    if (m) {
+      const d = parseInt(m[1], 10);
+      const h = parseInt(m[2], 10);
+      const min = parseInt(m[3], 10);
+      return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+    }
+    return null;
   });
 }
 
@@ -70,12 +86,11 @@ async function getRealListTimes(page) {
     proxy: proxyUrl ? { server: proxyUrl } : undefined
   });
 
-  const context = await browser.newContext({
+  const page = await browser.newPage({
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
   });
 
-  const page = await context.newPage();
   let reports = [];
 
   try {
@@ -115,7 +130,7 @@ async function getRealListTimes(page) {
     for (let i = 0; i < serverUrls.length; i++) {
       const url = serverUrls[i];
       const sIndex = i + 1;
-      console.log(`\n================= 正在处理服务器 [${sIndex}/${serverUrls.length}] =================`);
+      console.log(`\n================= 正在巡检服务器 [${sIndex}/${serverUrls.length}] =================`);
 
       await page.goto(url, { waitUntil: 'domcontentloaded' });
       await page.waitForTimeout(2500);
@@ -130,96 +145,68 @@ async function getRealListTimes(page) {
       await cleanPopup(page);
 
       // 读取当前时间
-      const beforeTimeRaw = await page.evaluate(() => {
-        const m = (document.body.innerText || '').match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
-        return m ? `${m[1]}天${m[2]}小时${m[3]}分` : '未知';
-      });
-      const beforeTime = formatTimeString(beforeTimeRaw);
-      console.log(`⏱️ 操作前剩余时长: ${beforeTime}`);
+      const timeData = await extractExpiryTime(page);
+      const beforeTime = timeData ? timeData.raw : '未获取到';
+      const remainHours = timeData ? timeData.totalHours : 99;
+      console.log(`⏱️ 操作前剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
 
-      // 点击 Renew now 打开弹窗
-      console.log('👉 点击 [Renew now]...');
-      const renewNowBtn = page.locator('button:has-text("Renew now")').first();
-      await renewNowBtn.waitFor({ state: 'visible', timeout: 10000 });
-      await renewNowBtn.click({ force: true });
-      await page.waitForTimeout(1500);
-      await cleanPopup(page);
-
-      // 核心延迟防线：在弹窗展开后耐心等待 8 秒，确保所有前置选项接口响应就绪并累积行为时间
-      console.log('⏳ 核心延迟缓冲：保持弹窗停留 8 秒，等待选项完全读取与防刷签名生成...');
-      for (let sec = 0; sec < 8; sec++) {
-        await cleanPopup(page);
-        await page.mouse.move(960 + sec * 5, 540 + sec * 3);
-        await page.waitForTimeout(1000);
-      }
-
-      // 检查 [60 hours] 选项
-      console.log('👉 检查 [60 hours] 选项框...');
-      const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
-
-      const canClick = await card.isEnabled({ timeout: 2000 }).catch(() => false);
-      const isLocked = await page.evaluate(() => {
-        const text = document.body.innerText || '';
-        return text.toLowerCase().includes('come back later');
-      });
-
-      if (canClick && !isLocked) {
-        console.log('✅ 选项已处于可点击就绪状态，模拟真人点击...');
-        await card.hover();
-        await page.waitForTimeout(400);
-        await card.click({ force: true });
-        console.log('👆 已完成点击！');
-
-        console.log('⏳ 等待后端数据库提交事务 (8 秒)...');
-        await page.waitForTimeout(8000);
+      // 只有剩余时长 < 46h 时才触发续期
+      if (remainHours < 46) {
+        console.log('🎯 剩余时长 < 46 小时，打开续期弹窗...');
+        const renewNowBtn = page.locator('button:has-text("Renew now")').first();
+        await renewNowBtn.waitFor({ state: 'visible', timeout: 10000 });
+        await renewNowBtn.click({ force: true });
+        await page.waitForTimeout(1500);
         await cleanPopup(page);
 
-        // 如果有多台机器，在处理下一台前进行安全冷却，防止同账号并发冲突
-        if (i < serverUrls.length - 1) {
-          console.log('☕ 安全冷却 8 秒，防止同账号并发频控...');
-          await page.waitForTimeout(8000);
+        // 核心延迟缓冲：保持弹窗停留 8 秒，生成防刷签名与 dwell_ms
+        console.log('⏳ 保持弹窗停留 8 秒，累积交互计时与签名生成...');
+        for (let sec = 0; sec < 8; sec++) {
+          await cleanPopup(page);
+          await page.mouse.move(960 + sec * 5, 540 + sec * 3);
+          await page.waitForTimeout(1000);
         }
 
-        reports.push(`🟢 <b>服务器 ${sIndex}</b>: 已触发点击 (+60h) [前序: ${beforeTime}]`);
+        console.log('👉 检查 [60 hours] 选项框...');
+        const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
+        const canClick = await card.isEnabled({ timeout: 2000 }).catch(() => false);
+
+        if (canClick) {
+          console.log('✅ 选项已就绪，执行物理点击...');
+          await card.hover();
+          await page.waitForTimeout(400);
+          await card.click({ force: true });
+          console.log('👆 点击完成！');
+
+          console.log('⏳ 等待后端入库事务处理 (8 秒)...');
+          await page.waitForTimeout(8000);
+          await cleanPopup(page);
+
+          // 刷新当前页面查看真实加时状态
+          console.log('🔄 刷新页面核对最新时长...');
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          await page.waitForTimeout(2000);
+          await cleanPopup(page);
+          await page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last().click({ force: true }).catch(() => {});
+          await page.waitForTimeout(1500);
+
+          const afterTimeData = await extractExpiryTime(page);
+          const afterTime = afterTimeData ? afterTimeData.raw : '已完成加时';
+
+          reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 (+60h)\n     └ 状态: ${beforeTime} ➔ <b>${afterTime}</b>`);
+        } else {
+          console.log('⏳ 选项未解锁，无需点击。');
+          await page.locator('button:has-text("✕"), [aria-label="Close"], button:has-text("Close")').first().click().catch(() => {});
+          reports.push(`⚪ <b>服务器 ${sIndex}</b>: 剩余 <b>${beforeTime}</b> (未到门槛，保持等待)`);
+        }
       } else {
-        console.log(`⏳ 选项处于置灰锁定状态（剩余 ${beforeTime} > 46h），无需点击。`);
-        await page.locator('button:has-text("✕"), [aria-label="Close"], button:has-text("Close")').first().click().catch(() => {});
+        console.log(`⏳ 剩余时长 ${beforeTime} (${remainHours.toFixed(1)}h > 46h)，安全充足，无需操作。`);
         reports.push(`⚪ <b>服务器 ${sIndex}</b>: 剩余 <b>${beforeTime}</b> (安全充足，保持等待)`);
       }
     }
 
-    // 终审核验：关闭操作上下文，新建干净的独立 Context 重新拉取列表页，杜绝前端内存假缓存
-    console.log('\n🔍 正在使用全新隔离会话拉取最终真实的后端数据库数据...');
-    const verifyContext = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    });
-    const verifyPage = await verifyContext.newPage();
-
-    await verifyPage.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded' });
-    await cleanPopup(verifyPage);
-    await verifyPage.locator('input[type="email"]').first().fill(email);
-    await verifyPage.locator('input[type="password"]').first().fill(password);
-    await verifyPage.locator('button[type="submit"]:has-text("Sign in")').first().click();
-    await verifyPage.waitForTimeout(3000);
-
-    await verifyPage.goto('https://freemchost.com/app/servers', { waitUntil: 'domcontentloaded' });
-    await verifyPage.waitForTimeout(3000);
-    await cleanPopup(verifyPage);
-
-    const finalRealMap = await getRealListTimes(verifyPage);
-    console.log('📋 数据库最终真实存留时间:', JSON.stringify(finalRealMap));
-    await verifyContext.close();
-
-    // 汇总真实的格式化报告
-    let finalReportLines = [];
-    for (let k = 0; k < serverUrls.length; k++) {
-      const sKey = `fmc0${k + 1}`.toLowerCase();
-      const realTime = finalRealMap[sKey] || '读取失败';
-      finalReportLines.push(`🖥️ <b>服务器 ${k + 1} (${sKey})</b>: 实际存留 ➔ <b>${realTime}</b>`);
-    }
-
-    const summary = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>真实入库核验:</b>\n${finalReportLines.join('\n')}\n\n<b>更新时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
+    // 格式化输出简洁干净的通知
+    const summary = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n\n')}\n\n<b>检查规则:</b> 低于 46h 门槛时自动激活续期\n<b>更新时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
     await sendTG(tgToken, tgChatId, summary);
 
   } catch (err) {
