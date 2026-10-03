@@ -15,9 +15,9 @@ async function sendTG(botToken, chatId, text) {
 // 顺手关掉可能出现的打分弹窗
 async function cleanPopup(page) {
   try {
-    const later = page.locator('text="Maybe later"').first();
+    const later = page.locator('button, a, span').filter({ hasText: /^Maybe later$/i }).first();
     if (await later.isVisible({ timeout: 200 })) {
-      await later.click();
+      await later.click({ force: true });
       console.log('🛡️ 顺手关闭了 Maybe later 弹窗');
       await page.waitForTimeout(300);
     }
@@ -30,7 +30,7 @@ function formatTimeString(raw) {
   return raw.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// 从当前页面精确提取倒计时
+// 精确提取倒计时
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
@@ -51,7 +51,6 @@ async function extractExpiryTime(page) {
         }
       }
     }
-
     const bodyText = document.body.innerText || '';
     const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
     if (m) {
@@ -84,12 +83,11 @@ async function extractExpiryTime(page) {
     proxy: proxyUrl ? { server: proxyUrl } : undefined
   });
 
-  const context = await browser.newContext({
+  const page = await browser.newPage({
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
   });
 
-  const page = await context.newPage();
   let reports = [];
 
   try {
@@ -98,32 +96,21 @@ async function extractExpiryTime(page) {
     await page.waitForTimeout(1500);
     await cleanPopup(page);
 
-    const emailInput = page.locator('input[type="email"]').first();
-    await emailInput.click();
-    await emailInput.fill(email);
-
-    const passInput = page.locator('input[type="password"]').first();
-    await passInput.click();
-    await passInput.fill(password);
-    await page.waitForTimeout(300);
-
-    const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
-    await signInBtn.click();
+    await page.locator('input[type="email"]').first().fill(email);
+    await page.locator('input[type="password"]').first().fill(password);
+    await page.locator('button[type="submit"]:has-text("Sign in")').first().click();
 
     let loggedIn = false;
     for (let wait = 0; wait < 15; wait++) {
       await page.waitForTimeout(1000);
-      const curUrl = page.url();
-      if (!curUrl.includes('/login')) {
+      if (!page.url().includes('/login')) {
         loggedIn = true;
         break;
       }
       await cleanPopup(page);
     }
 
-    if (!loggedIn) {
-      throw new Error('登录未跳转，可能密码错误或被验证码拦截');
-    }
+    if (!loggedIn) throw new Error('登录未跳转，可能密码错误或被拦截');
     console.log('✅ 登录成功！');
 
     for (let i = 0; i < serverUrls.length; i++) {
@@ -135,7 +122,6 @@ async function extractExpiryTime(page) {
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 精准定位 PLAN Billing 标签页
       console.log('👉 切换至 PLAN Billing 页面...');
       const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
       await billingTab.scrollIntoViewIfNeeded().catch(() => {});
@@ -143,73 +129,50 @@ async function extractExpiryTime(page) {
       await page.waitForTimeout(2000);
       await cleanPopup(page);
 
-      // 读取当前时间
       const timeData = await extractExpiryTime(page);
       const beforeTime = timeData ? timeData.raw : '未获取到';
       const remainHours = timeData ? timeData.totalHours : 99;
-      console.log(`⏱️ 操作前剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
+      console.log(`⏱️️ 操作前剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
 
       if (remainHours < 46) {
         console.log('🎯 剩余时长 < 46 小时，打开续期弹窗...');
         const renewNowBtn = page.locator('button:has-text("Renew now")').first();
-        await renewNowBtn.waitFor({ state: 'visible', timeout: 10000 });
         await renewNowBtn.click({ force: true });
         await page.waitForTimeout(1500);
         await cleanPopup(page);
 
-        // 核心延迟防线：等待 8 秒
-        console.log('⏳ 保持弹窗停留 8 秒，累积交互计时与签名生成...');
+        // 积累人机交互防刷时间
+        console.log('⏳ 弹窗停留缓冲 8 秒...');
         for (let sec = 0; sec < 8; sec++) {
           await cleanPopup(page);
           await page.mouse.move(960 + sec * 5, 540 + sec * 3);
           await page.waitForTimeout(1000);
         }
 
-        // 关键防护：在即将点击前，做最后一次弹窗清理，并强制点击续期弹窗头部重获焦点
-        await cleanPopup(page);
-        const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
-        await renewModal.click({ position: { x: 50, y: 20 } }).catch(() => {});
-        await page.waitForTimeout(300);
-
-        console.log('👉 检查并锁定 [60 hours] 选项框...');
-        const card = renewModal.locator('div, button').filter({ hasText: '60 hours' }).last();
-
-        // 核心网络响应硬拦截：必须抓到真实的写库 RPC 请求
-        let writePacketSent = false;
-        page.on('response', res => {
-          const u = res.url();
-          if (u.includes('_serverFn') && res.status() === 200 && !u.includes('feedback')) {
-            // 抓取到真正的 action 触发
-            writePacketSent = true;
-          }
-        });
-
-        // 最多尝试 3 次针对性打击，直到网络层真正发出了请求
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          console.log(`🖱️ 发起物理击发序列 #${attempt}...`);
-          await card.scrollIntoViewIfNeeded().catch(() => {});
-          await card.hover();
-          await page.waitForTimeout(200);
-          await card.click({ delay: 100 });
-          await page.keyboard.press('Enter');
-
-          // 观察 2 秒是否抓到发包
-          await page.waitForTimeout(2000);
-          if (writePacketSent) {
-            console.log('📡 确认捕捉到真实加时发包离开浏览器！');
-            break;
-          }
-          console.log('⚠️ 尚未捕捉到写库包，重新聚焦并补刀...');
-          await renewModal.click({ position: { x: 100, y: 50 } }).catch(() => {});
-          await cleanPopup(page);
+        // 确保弹窗仍在显示，不在则重新点开
+        const isModalVisible = await page.locator('text="Keep your server online"').isVisible().catch(() => false);
+        if (!isModalVisible) {
+          console.log('⚠️ 弹窗曾被异常关闭，重新拉起 Renew now...');
+          await renewNowBtn.click({ force: true });
+          await page.waitForTimeout(1500);
         }
+
+        console.log('👉 定位并点击 [60 hours] 选项...');
+        // 直接全局精准锁定包含 60 hours 的卡片，不再使用死板的多层嵌套
+        const targetOption = page.locator('div, button').filter({ hasText: /^60 hours/i }).last();
+        await targetOption.waitFor({ state: 'visible', timeout: 8000 });
+        
+        await targetOption.hover();
+        await page.waitForTimeout(300);
+        await targetOption.click({ force: true });
+        console.log('👆 已完成点击！');
 
         console.log('⏳ 等待后端入库事务完全提交 (8 秒)...');
         await page.waitForTimeout(8000);
         await cleanPopup(page);
 
-        // 彻底杜绝本地内存假缓存：创建完全干净的隔离上下文核验最终真实数据
-        console.log('🔍 启动全新独立上下文读取真实数据库时间...');
+        // 使用干净的隔离上下文进行核验，杜绝 SPA 内存假数据
+        console.log('🔍 启动全新独立上下文核实实际数据库入库时间...');
         const verifyCtx = await browser.newContext({
           viewport: { width: 1920, height: 1080 },
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -233,7 +196,6 @@ async function extractExpiryTime(page) {
 
         console.log(`⏱️ 终审核验结果: 前序 ${beforeTime} ➔ 数据库实际存留: ${finalTime}`);
 
-        // 只有数据库真真实实增加了 20 小时以上才发成功报告
         if (finalHours > remainHours + 20) {
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 (+60h)\n     └ 状态: ${beforeTime} ➔ <b>${finalTime}</b>`);
         } else {
