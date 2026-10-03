@@ -30,37 +30,43 @@ function formatTimeString(raw) {
   return raw.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// 精确提取倒计时
-async function extractExpiryTime(page) {
-  return await page.evaluate(() => {
-    const allEls = Array.from(document.querySelectorAll('*'));
-    const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
-    if (header) {
-      let container = header.parentElement;
-      for (let k = 0; k < 4; k++) {
-        if (container) {
-          const txt = container.innerText || '';
-          const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
-          if (m) {
-            const d = parseInt(m[1], 10);
-            const h = parseInt(m[2], 10);
-            const min = parseInt(m[3], 10);
-            return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+// 精确提取倒计时，带轮询重试
+async function extractExpiryTime(page, maxTries = 5) {
+  for (let i = 0; i < maxTries; i++) {
+    const res = await page.evaluate(() => {
+      const allEls = Array.from(document.querySelectorAll('*'));
+      const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
+      if (header) {
+        let container = header.parentElement;
+        for (let k = 0; k < 4; k++) {
+          if (container) {
+            const txt = container.innerText || '';
+            const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
+            if (m) {
+              const d = parseInt(m[1], 10);
+              const h = parseInt(m[2], 10);
+              const min = parseInt(m[3], 10);
+              return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+            }
+            container = container.parentElement;
           }
-          container = container.parentElement;
         }
       }
-    }
-    const bodyText = document.body.innerText || '';
-    const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
-    if (m) {
-      const d = parseInt(m[1], 10);
-      const h = parseInt(m[2], 10);
-      const min = parseInt(m[3], 10);
-      return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
-    }
-    return null;
-  });
+      const bodyText = document.body.innerText || '';
+      const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
+      if (m) {
+        const d = parseInt(m[1], 10);
+        const h = parseInt(m[2], 10);
+        const min = parseInt(m[3], 10);
+        return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+      }
+      return null;
+    });
+
+    if (res) return res;
+    await page.waitForTimeout(1000);
+  }
+  return null;
 }
 
 (async () => {
@@ -132,7 +138,7 @@ async function extractExpiryTime(page) {
       const timeData = await extractExpiryTime(page);
       const beforeTime = timeData ? timeData.raw : '未获取到';
       const remainHours = timeData ? timeData.totalHours : 99;
-      console.log(`⏱️️ 操作前剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
+      console.log(`⏱ 操作前剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
 
       if (remainHours < 46) {
         console.log('🎯 剩余时长 < 46 小时，打开续期弹窗...');
@@ -158,7 +164,6 @@ async function extractExpiryTime(page) {
         }
 
         console.log('👉 定位并点击 [60 hours] 选项...');
-        // 直接全局精准锁定包含 60 hours 的卡片，不再使用死板的多层嵌套
         const targetOption = page.locator('div, button').filter({ hasText: /^60 hours/i }).last();
         await targetOption.waitFor({ state: 'visible', timeout: 8000 });
         
@@ -167,39 +172,33 @@ async function extractExpiryTime(page) {
         await targetOption.click({ force: true });
         console.log('👆 已完成点击！');
 
-        console.log('⏳ 等待后端入库事务完全提交 (8 秒)...');
-        await page.waitForTimeout(8000);
+        console.log('⏳ 等待后端入库事务完全提交并落库 (10 秒)...');
+        await page.waitForTimeout(10000);
         await cleanPopup(page);
 
-        // 使用干净的隔离上下文进行核验，杜绝 SPA 内存假数据
-        console.log('🔍 启动全新独立上下文核实实际数据库入库时间...');
-        const verifyCtx = await browser.newContext({
-          viewport: { width: 1920, height: 1080 },
-          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        // 原生硬刷新并重新抓取最新真实数据
+        console.log('🔄 硬刷新当前服务器详情页核对最终时长...');
+        await page.reload({ waitUntil: 'networkidle' }).catch(async () => {
+          await page.reload({ waitUntil: 'domcontentloaded' });
         });
-        const vPage = await verifyCtx.newPage();
-        await vPage.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded' });
-        await vPage.locator('input[type="email"]').first().fill(email);
-        await vPage.locator('input[type="password"]').first().fill(password);
-        await vPage.locator('button[type="submit"]:has-text("Sign in")').first().click();
-        await vPage.waitForTimeout(2500);
+        await page.waitForTimeout(3000);
+        await cleanPopup(page);
 
-        await vPage.goto(url, { waitUntil: 'domcontentloaded' });
-        await vPage.waitForTimeout(2000);
-        await vPage.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last().click({ force: true }).catch(() => {});
-        await vPage.waitForTimeout(1500);
+        const tabRecheck = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
+        await tabRecheck.scrollIntoViewIfNeeded().catch(() => {});
+        await tabRecheck.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(2000);
 
-        const realTimeData = await extractExpiryTime(vPage);
-        const finalTime = realTimeData ? realTimeData.raw : '未获取到';
-        const finalHours = realTimeData ? realTimeData.totalHours : remainHours;
-        await verifyCtx.close();
+        const finalTimeData = await extractExpiryTime(page, 5);
+        const finalTime = finalTimeData ? finalTimeData.raw : '未获取到';
+        const finalHours = finalTimeData ? finalTimeData.totalHours : remainHours;
 
-        console.log(`⏱️ 终审核验结果: 前序 ${beforeTime} ➔ 数据库实际存留: ${finalTime}`);
+        console.log(`⏱️ 终审核验结果: 前序 ${beforeTime} ➔ 最新实际存留: ${finalTime}`);
 
         if (finalHours > remainHours + 20) {
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 (+60h)\n     └ 状态: ${beforeTime} ➔ <b>${finalTime}</b>`);
         } else {
-          reports.push(`🔴 <b>服务器 ${sIndex}</b>: 本次点击未入账 (当前: ${finalTime})\n     └ 机制: 下个周期自动重试`);
+          reports.push(`🔴 <b>服务器 ${sIndex}</b>: 触发点击未增加时间 (当前: ${finalTime})\n     └ 状态: 下个定时周期自动复查`);
         }
       } else {
         console.log(`⏳ 剩余时长 ${beforeTime} (${remainHours.toFixed(1)}h > 46h)，安全充足，无需操作。`);
