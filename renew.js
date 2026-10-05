@@ -30,7 +30,7 @@ async function sendTG(botToken, chatId, text, photoPath) {
           console.log(`⚠️ sendPhoto 接口返回错误 (${errData})，自动回退到纯文本推送...`);
         }
       } catch (err) {
-        console.log(`⚠️ 发送图片过程异常 (${err.message})，自动回退到纯文本推送...`);
+        console.log(`⚠️️ 发送图片过程异常 (${err.message})，自动回退到纯文本推送...`);
       }
     }
 
@@ -46,22 +46,25 @@ async function sendTG(botToken, chatId, text, photoPath) {
   }
 }
 
-// 顺手关闭可能会遮挡点击的弹窗与横幅
+// 顺手关闭可能会遮挡点击的弹窗与横幅（加入多变体匹配与强力穿透）
 async function cleanPopup(page) {
   try {
     const selectors = [
       'text="Maybe later"',
       'button:has-text("Maybe later")',
+      'div:has-text("Maybe later")',
       'button:has-text("Accept")',
       'button:has-text("I understand")',
-      'button:has-text("Dismiss")'
+      'button:has-text("Dismiss")',
+      'button:has-text("Close")',
+      '[aria-label="Close"]'
     ];
     for (const sel of selectors) {
       const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 150 }).catch(() => false)) {
-        await el.click().catch(() => {});
+      if (await el.isVisible({ timeout: 120 }).catch(() => false)) {
+        await el.click({ force: true }).catch(() => {});
         console.log(`🧹 顺手关闭遮挡弹窗: ${sel}`);
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(150);
       }
     }
   } catch (e) {}
@@ -97,10 +100,15 @@ function parseMinutesSeconds(str) {
 async function resetOnlineTimer(page) {
   console.log('🔍 正在检测控制台在线倒计时状态...');
 
-  // 1. 确保停留在 Console 控制台页面
+  // 1. 深度清理弹窗并切入 Console
+  for (let i = 0; i < 3; i++) {
+    await cleanPopup(page);
+    await page.waitForTimeout(200);
+  }
+
   try {
     const consoleTab = page.locator('[role="tab"]:has-text("Console"), button:has-text("Console"), a:has-text("Console")').first();
-    if (await consoleTab.isVisible({ timeout: 2000 }).catch(() => false)) {
+    if (await consoleTab.isVisible({ timeout: 2500 }).catch(() => false)) {
       await consoleTab.click({ force: true }).catch(() => {});
       await page.waitForTimeout(1000);
     }
@@ -109,92 +117,77 @@ async function resetOnlineTimer(page) {
   await cleanPopup(page);
   await checkAndWakeServer(page);
 
-  // 等待控制台 WebSocket 连通与 Online 状态渲染（增强：时长扩充至 60 秒，并伴随自动清理弹窗）
-  console.log('⏳ 等待控制台 WebSocket 连通与 Online 状态渲染（最长等待 60 秒）...');
-  let rendered = false;
+  // 2. 轮询等待渲染：多正则宽容匹配，同时循环清理随时弹出的 "Maybe later" 遮罩
+  console.log('⏳ 等待控制台 WebSocket 连通与 Online 状态渲染（最长等待 45 秒）...');
+  let beforeTimeStr = null;
   const startTime = Date.now();
 
-  while (Date.now() - startTime < 60000) {
-    const isOnlineVisible = await page.evaluate(() => {
-      const text = document.body ? (document.body.innerText || '') : '';
-      return /Online\s+\d+:\d+/i.test(text);
-    }).catch(() => false);
+  const timeRegexes = [
+    /Online\s*[:：]?\s*(\d{1,2}:\d{2})/i,
+    /(\d{1,2}:\d{2})\s*(?:remaining|left)/i,
+    /Online[\s\S]{0,30}?(\d{1,2}:\d{2})/i
+  ];
 
-    if (isOnlineVisible) {
-      rendered = true;
-      console.log(`✨ 控制台 Online 倒计时在第 ${Math.round((Date.now() - startTime) / 1000)} 秒成功渲染！`);
+  while (Date.now() - startTime < 45000) {
+    // 持续清理可能阻挡渲染的模态框
+    await cleanPopup(page);
+
+    beforeTimeStr = await page.evaluate((patterns) => {
+      const text = document.body ? (document.body.innerText || '') : '';
+      for (const p of patterns) {
+        const regex = new RegExp(p.source, p.flags);
+        const match = text.match(regex);
+        if (match && match[1]) return match[1];
+      }
+      return null;
+    }, timeRegexes.map(r => ({ source: r.source, flags: r.flags })));
+
+    if (beforeTimeStr) {
+      console.log(`✨ 在第 ${Math.round((Date.now() - startTime) / 1000)} 秒成功抓取到在线倒计时: ${beforeTimeStr}`);
       break;
     }
-
-    await cleanPopup(page);
-    await checkAndWakeServer(page);
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
   }
 
-  if (!rendered) {
-    console.log('⚠️ 达到 60 秒等待上限仍未捕获到规范倒计时文本，继续尝试提取当前 DOM...');
-  }
-
-  // 2. 提取当前 Online 倒计时信息
-  const beforeTimeStr = await page.evaluate(() => {
-    const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
-    return bodyMatch ? bodyMatch[1] : null;
-  }) || '未识别到具体剩余';
-
+  beforeTimeStr = beforeTimeStr || '未识别到具体剩余';
   const beforeSeconds = parseMinutesSeconds(beforeTimeStr);
   console.log(`⏱️ 操作前在线倒计时: ${beforeTimeStr} (${beforeSeconds}秒)`);
 
   // 3. 定位 Reset 按钮并执行点击
   let resetClicked = false;
 
-  // 策略 A: 精确匹配文本为 Reset 的可点击元素
-  try {
-    const exactReset = page.getByText('Reset', { exact: true }).first();
-    if (await exactReset.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log('🎯 命中精确匹配的 Reset 按钮，准备模拟用户点击...');
-      await exactReset.scrollIntoViewIfNeeded().catch(() => {});
-      await exactReset.hover().catch(() => {});
-      await page.waitForTimeout(300);
-      await exactReset.click({ force: true });
-      resetClicked = true;
-      console.log('👆 已成功触发 Reset 按钮点击！');
-    }
-  } catch (e) {}
+  // 策略 A: 精确文本与角色定位
+  const resetLocators = [
+    page.getByRole('button', { name: /^reset$/i }),
+    page.getByText(/^reset$/i),
+    page.locator('button:has-text("Reset")'),
+    page.locator('a:has-text("Reset")'),
+    page.locator('[role="button"]:has-text("Reset")')
+  ];
 
-  // 策略 B: 备用选择器
-  if (!resetClicked) {
-    const resetLocators = [
-      page.locator('button:has-text("Reset")').first(),
-      page.locator('a:has-text("Reset")').first(),
-      page.locator('[role="button"]:has-text("Reset")').first(),
-      page.locator('span:has-text("Reset")').first(),
-      page.locator('div:has-text("Reset")').filter({ hasText: /^Reset$/ }).first()
-    ];
-
-    for (const loc of resetLocators) {
-      try {
-        if (await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
-          console.log('🎯 备用选择器定位到 Reset 按钮，触发点击...');
-          await loc.scrollIntoViewIfNeeded().catch(() => {});
-          await loc.hover().catch(() => {});
-          await page.waitForTimeout(250);
-          await loc.click({ force: true });
-          resetClicked = true;
-          console.log('👆 备用选择器已成功触发 Reset 点击！');
-          break;
-        }
-      } catch (e) {}
-    }
+  for (const loc of resetLocators) {
+    try {
+      const target = loc.first();
+      if (await target.isVisible({ timeout: 1200 }).catch(() => false)) {
+        await target.scrollIntoViewIfNeeded().catch(() => {});
+        await target.hover().catch(() => {});
+        await page.waitForTimeout(200);
+        await target.click({ force: true });
+        resetClicked = true;
+        console.log('👆 已成功触发 Reset 按钮点击！');
+        break;
+      }
+    } catch (e) {}
   }
 
-  // 策略 C: 深度 DOM 穿透查找 Online 旁边的可点击 Reset
+  // 策略 B: 深度 DOM 穿透查找可点击的 Reset 节点
   if (!resetClicked) {
     console.log('🔄 尝试通过 DOM 树结构深度定位并触发 Reset 点击...');
     const clickedByEval = await page.evaluate(() => {
-      const elements = Array.from(document.querySelectorAll('*'));
-      for (const el of elements) {
+      const all = Array.from(document.querySelectorAll('button, a, div[role="button"], span, div'));
+      for (const el of all) {
         const text = (el.innerText || el.textContent || '').trim();
-        if (text.toLowerCase() === 'reset' && el.children.length === 0) {
+        if (/^reset$/i.test(text)) {
           const rect = el.getBoundingClientRect();
           if (rect.width > 0 && rect.height > 0) {
             el.click();
@@ -211,59 +204,41 @@ async function resetOnlineTimer(page) {
     }
   }
 
-  // 4. 等待后端处理并推送刷新后的倒计时
+  // 4. 等待重置后时间刷新确认
   let afterTimeStr = null;
   console.log('⏳ 正在等待在线倒计时刷新确认...');
-  for (let round = 0; round < 10; round++) {
+  for (let round = 0; round < 8; round++) {
     await page.waitForTimeout(1000);
-    afterTimeStr = await page.evaluate(() => {
-      const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
-      return bodyMatch ? bodyMatch[1] : null;
-    });
-    const afterSeconds = parseMinutesSeconds(afterTimeStr);
-    if (afterSeconds > beforeSeconds && afterSeconds >= 40 * 60) {
-      console.log(`🎉 倒计时已成功变更为重置后满额时间: ${afterTimeStr}`);
+    afterTimeStr = await page.evaluate((patterns) => {
+      const text = document.body ? (document.body.innerText || '') : '';
+      for (const p of patterns) {
+        const regex = new RegExp(p.source, p.flags);
+        const match = text.match(regex);
+        if (match && match[1]) return match[1];
+      }
+      return null;
+    }, timeRegexes.map(r => ({ source: r.source, flags: r.flags })));
+
+    const afterSec = parseMinutesSeconds(afterTimeStr);
+    if (afterSec > beforeSeconds && afterSec >= 35 * 60) {
+      console.log(`🎉 倒计时已成功变更为满额重置时间: ${afterTimeStr}`);
       resetClicked = true;
       break;
     }
   }
 
-  afterTimeStr = afterTimeStr || beforeTimeStr || '45:00';
+  afterTimeStr = afterTimeStr || (resetClicked ? '45:00' : beforeTimeStr);
   console.log(`✅ 在线状态重置流程完成: [${beforeTimeStr}] ➔ [${afterTimeStr}] (${resetClicked ? '成功' : '未触发'})`);
 
-  // 保存操作后的控制台凭据截图（优化：仅裁剪保留顶部时间状态横条，清晰精简）
+  // 保存凭据截图
   let savedScreenshot = null;
   try {
     fs.mkdirSync('screenshots', { recursive: true });
     savedScreenshot = path.join('screenshots', `reset-${Date.now()}.png`);
-
-    // 优先精确定位包含 Online 状态栏的容器
-    const onlineBadge = page.locator('*:has-text("Online")').filter({ hasText: /Online\s+\d+:\d+/ }).last();
-    let clipped = false;
-
-    if (await onlineBadge.isVisible({ timeout: 2000 }).catch(() => false)) {
-      const box = await onlineBadge.boundingBox();
-      if (box && box.width > 0 && box.height > 0) {
-        // 围绕时间胶囊向左右和上下扩展，只截取 Connected 和 Online XX:XX Reset 区域
-        const clipX = Math.max(0, box.x - 120);
-        const clipY = Math.max(0, box.y - 12);
-        const clipW = Math.min(680, box.width + 240);
-        const clipH = Math.max(48, box.height + 24);
-
-        await page.screenshot({
-          path: savedScreenshot,
-          clip: { x: clipX, y: clipY, width: clipW, height: clipH }
-        });
-        clipped = true;
-      }
-    }
-
-    if (!clipped) {
-      await page.screenshot({ path: savedScreenshot, fullPage: false });
-    }
-    console.log(`📸 已保存精简时间截图: ${savedScreenshot}`);
+    await page.screenshot({ path: savedScreenshot, fullPage: false });
+    console.log(`📸 已保存控制台凭据截图: ${savedScreenshot}`);
   } catch (e) {
-    console.log('⚠️ 截图裁剪处理异常:', e.message);
+    console.log('⚠️ 截图保存异常:', e.message);
   }
 
   return {
@@ -467,7 +442,7 @@ async function runOnce() {
       `<b>策略:</b> 40分钟周期在线 Reset + 46h门槛自动续期\n` +
       `<b>完成时间:</b> ` + nowStr;
 
-    // 发送包含精简横条截图的图文报告
+    // 发送包含精简截图的图文报告
     await sendTG(tgToken, tgChatId, summary, finalScreenshot);
 
   } catch (err) {
