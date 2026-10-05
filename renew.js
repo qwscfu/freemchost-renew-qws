@@ -109,15 +109,30 @@ async function resetOnlineTimer(page) {
   await cleanPopup(page);
   await checkAndWakeServer(page);
 
-  // 等待控制台 WebSocket 连通与 Online 状态渲染
-  console.log('⏳ 等待控制台 WebSocket 连通与 Online 状态渲染...');
-  try {
-    await page.waitForFunction(() => {
+  // 等待控制台 WebSocket 连通与 Online 状态渲染（增强：时长扩充至 60 秒，并伴随自动清理弹窗）
+  console.log('⏳ 等待控制台 WebSocket 连通与 Online 状态渲染（最长等待 60 秒）...');
+  let rendered = false;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < 60000) {
+    const isOnlineVisible = await page.evaluate(() => {
       const text = document.body ? (document.body.innerText || '') : '';
       return /Online\s+\d+:\d+/i.test(text);
-    }, { timeout: 15000 });
-  } catch (e) {
-    console.log('⚠️ 等待 Online 倒计时渲染超时，继续尝试提取当前 DOM...');
+    }).catch(() => false);
+
+    if (isOnlineVisible) {
+      rendered = true;
+      console.log(`✨ 控制台 Online 倒计时在第 ${Math.round((Date.now() - startTime) / 1000)} 秒成功渲染！`);
+      break;
+    }
+
+    await cleanPopup(page);
+    await checkAndWakeServer(page);
+    await page.waitForTimeout(2000);
+  }
+
+  if (!rendered) {
+    console.log('⚠️ 达到 60 秒等待上限仍未捕获到规范倒计时文本，继续尝试提取当前 DOM...');
   }
 
   // 2. 提取当前 Online 倒计时信息
