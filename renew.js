@@ -41,17 +41,20 @@ async function sendTG(botToken, chatId, text, photoPath) {
   }
 }
 
-// 清除遮挡弹窗
+// 清理阻挡点击的 Modal 弹窗（重点压制 Maybe later 与 Accept）
 async function cleanPopup(page) {
   try {
-    const selectors = [
-      'text="Maybe later"',
+    const popups = [
       'button:has-text("Maybe later")',
+      'div[role="dialog"] button:has-text("Maybe later")',
+      'text="Maybe later"',
       'button:has-text("Accept")',
       'button:has-text("I understand")',
-      'button:has-text("Dismiss")'
+      'button:has-text("Dismiss")',
+      'button:has-text("Close")',
+      '[aria-label="Close"]'
     ];
-    for (const sel of selectors) {
+    for (const sel of popups) {
       const el = page.locator(sel).first();
       if (await el.isVisible({ timeout: 150 }).catch(() => false)) {
         await el.click({ force: true }).catch(() => {});
@@ -101,88 +104,99 @@ async function doLogin(page, email, password) {
   console.log('🎉 登录成功！');
 }
 
-// 检查服务器是否开启（同时识别页面存在 connect 和 running 字样）
+// 检查服务器是否开启（精确定位 Running 绿点与状态徽章）
 async function ensureServerRunning(page) {
   console.log('🔍 正在检测服务器运行状态...');
   
-  // 确保处于 Console 控制台
+  // 确保处于 Console 控制台标签
   try {
     const consoleTab = page.locator('[role="tab"]:has-text("Console"), button:has-text("Console"), a:has-text("Console")').first();
-    if (await consoleTab.isVisible({ timeout: 2000 }).catch(() => false)) {
+    if (await consoleTab.isVisible({ timeout: 2500 }).catch(() => false)) {
       await consoleTab.click({ force: true }).catch(() => {});
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(1200);
     }
   } catch (e) {}
 
   await cleanPopup(page);
 
-  const checkStatus = async () => {
+  // 精准判定函数：同时满足状态卡片处于 running 且有活跃绿点或监控活跃
+  const isServerRunning = async () => {
     return await page.evaluate(() => {
-      const text = (document.body ? document.body.innerText : '').toLowerCase();
-      const hasConnect = text.includes('connect');
-      const hasRunning = text.includes('running');
-      return hasConnect && hasRunning;
+      const fullText = (document.body ? document.body.innerText : '').toLowerCase();
+      // 包含 connected 标识
+      const hasConnected = fullText.includes('connected');
+      // 包含 Resource usage 下方的 running 标识
+      const hasRunningBadge = Array.from(document.querySelectorAll('*')).some(el => {
+        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+        return t === 'running' && el.children.length === 0;
+      });
+      return hasConnected && hasRunningBadge;
     });
   };
 
-  let isRunning = await checkStatus();
-  if (isRunning) {
+  let running = await isServerRunning();
+  if (running) {
     console.log('✅ 服务器当前已处于运行状态 (Connected & Running)');
     return true;
   }
 
-  console.log('⚠️ 服务器当前未完全开启，尝试寻找并点击 Start 三角开机按钮...');
-  
-  // 匹配三角启动按钮：优先匹配带 play 图标/start 属性/start 文本的按钮
-  const startLocators = [
-    page.locator('button:has(svg.fa-play)'),
-    page.locator('button:has(svg[data-icon="play"])'),
-    page.locator('button[aria-label*="start" i]'),
-    page.locator('button:has-text("Start")'),
-    page.locator('div[role="button"]:has-text("Start")')
+  console.log('⚡ 检测到服务器未处于运行状态，准备触发 Start 三角开机按钮...');
+
+  // 精准定位带有 play 图标（根据抓包 play-jdMzkCl1.js）的启动按钮
+  const playButtonSelectors = [
+    'button:has(svg.lucide-play)',
+    'button:has(svg[data-icon="play"])',
+    'button:has(svg.fa-play)',
+    'button[aria-label*="start" i]',
+    'button:has-text("Start")'
   ];
 
-  let clicked = false;
-  for (const loc of startLocators) {
-    const btn = loc.first();
-    if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+  let startClicked = false;
+  for (const sel of playButtonSelectors) {
+    const btn = page.locator(sel).first();
+    if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
-      await btn.click({ force: true }).catch(() => {});
-      clicked = true;
-      console.log('⚡ 已成功触发开机启动按钮！');
+      await btn.click({ force: true });
+      startClicked = true;
+      console.log(`👆 已成功点击开机按钮: ${sel}`);
       break;
     }
   }
 
-  if (!clicked) {
-    console.log('⚠️ 未能定位到明确的 Start 按钮，尝试通过 SVG 图标穿透匹配...');
-    clicked = await page.evaluate(() => {
-      const svgs = Array.from(document.querySelectorAll('button svg, a svg'));
-      for (const svg of svgs) {
-        const p = svg.closest('button') || svg.closest('a');
-        if (p && (svg.innerHTML.includes('polygon') || svg.innerHTML.includes('path'))) {
-          p.click();
-          return true;
+  // 备用穿透：如果上述选择器未命中，直接遍历 SVG 多边形图标所在的按钮
+  if (!startClicked) {
+    console.log('🔄 备用策略：深度遍历 SVG 三角图元并触发点击...');
+    startClicked = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button'));
+      for (const b of btns) {
+        const svg = b.querySelector('svg');
+        if (svg) {
+          const html = svg.innerHTML.toLowerCase();
+          // lucide-play 的 svg path 包含多边形或三角形属性
+          if (html.includes('polygon') || svg.classList.contains('lucide-play') || b.getAttribute('aria-label') === 'Start') {
+            b.click();
+            return true;
+          }
         }
       }
       return false;
     });
   }
 
-  // 点击后等待启动渲染并再次核查
-  console.log('⏳ 正在等待服务器启动完毕...');
+  // 等待服务器唤醒上线（轮询等待 30 秒）
+  console.log('⏳ 正在等待服务器开机就绪...');
   for (let i = 0; i < 15; i++) {
     await page.waitForTimeout(2000);
     await cleanPopup(page);
-    isRunning = await checkStatus();
-    if (isRunning) {
-      console.log(`🎉 服务器已成功启动进入运行状态！(耗时约 ${(i + 1) * 2}s)`);
+    running = await isServerRunning();
+    if (running) {
+      console.log(`🎉 服务器已成功启动完毕！(耗时约 ${(i + 1) * 2}s)`);
       return true;
     }
   }
 
-  console.log('⚠️ 超时未能检测到 Connected & Running 标识，继续进行后续检测...');
-  return isRunning;
+  console.log(`⚠️ 服务器开机状态检测结束，最终状态: ${running ? '已开启' : '未检测到开启'}`);
+  return running;
 }
 
 // 提取 Plan Billing 页面到期时间
@@ -219,13 +233,13 @@ async function extractExpiryTime(page) {
   });
 }
 
-// 检查并执行 Plan 租期续期，只对剩余时间横条进行精准截图
+// 核对并处理 Plan 租期，只截图剩余时长卡片
 async function handleBillingRenew(page) {
   let savedScreenshot = null;
   try {
     console.log('👉 切换至 PLAN Billing 页面核对租期...');
     const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
-    if (await billingTab.isVisible({ timeout: 3000 }).catch(() => false)) {
+    if (await billingTab.isVisible({ timeout: 3500 }).catch(() => false)) {
       await billingTab.click({ force: true });
       await page.waitForTimeout(2000);
       await cleanPopup(page);
@@ -265,21 +279,20 @@ async function handleBillingRenew(page) {
         }
       }
 
-      // 精确截取最新剩余续期时长模块
+      // 精确只裁剪剩余时长模块卡片
       try {
         fs.mkdirSync('screenshots', { recursive: true });
         savedScreenshot = path.join('screenshots', `billing-${Date.now()}.png`);
 
-        // 优先定位 TIME UNTIL EXPIRY 的父容器卡片
         const expiryHeader = page.locator('text="TIME UNTIL EXPIRY"').first();
         let clipped = false;
 
-        if (await expiryHeader.isVisible({ timeout: 2000 }).catch(() => false)) {
+        if (await expiryHeader.isVisible({ timeout: 2500 }).catch(() => false)) {
           const cardBox = await expiryHeader.evaluate(el => {
             let p = el.parentElement;
             for (let i = 0; i < 3 && p; i++) {
               const r = p.getBoundingClientRect();
-              if (r.width > 150 && r.height > 60) {
+              if (r.width > 120 && r.height > 50) {
                 return { x: r.x, y: r.y, width: r.width, height: r.height };
               }
               p = p.parentElement;
@@ -291,10 +304,10 @@ async function handleBillingRenew(page) {
             await page.screenshot({
               path: savedScreenshot,
               clip: {
-                x: Math.max(0, cardBox.x - 10),
-                y: Math.max(0, cardBox.y - 10),
-                width: cardBox.width + 20,
-                height: cardBox.height + 20
+                x: Math.max(0, cardBox.x - 8),
+                y: Math.max(0, cardBox.y - 8),
+                width: cardBox.width + 16,
+                height: cardBox.height + 16
               }
             });
             clipped = true;
@@ -317,11 +330,12 @@ async function handleBillingRenew(page) {
   return { status: '核对未完成', screenshot: savedScreenshot };
 }
 
-// 主任务流程
+// 主任务入口
 async function runOnce() {
   const email = (process.env.FREE_EMAIL || 'yuxiaojie0322@gmail.com').trim();
   const password = process.env.FREE_PASSWORD || 'YxJ223512@';
-  const rawUrls = (process.env.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/1df49f71-bb1b-454c-9cd1-70a46422a4f6').trim();
+  // 修正为准确的服务器 ID URL
+  const rawUrls = (process.env.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2').trim();
   const proxyUrl = (process.env.PROXY_URL || '').trim();
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
   const tgChatId = (process.env.TG_CHAT_ID || '').trim();
@@ -359,10 +373,10 @@ async function runOnce() {
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 步骤 1：确认开机状态，如果未开启则触发 Start 三角键
+      // 步骤 1：先确保开机，检测 Running 标识并在必要时点击 Start 三角键
       const isRunning = await ensureServerRunning(page);
 
-      // 步骤 2：确定状态后切换至 Billing 执行加时续期与截取时长
+      // 步骤 2：确定状态后切换至 Billing 执行租期检查、续期及精准截取时长
       const billRes = await handleBillingRenew(page);
       if (billRes.screenshot) {
         finalScreenshot = billRes.screenshot;
@@ -370,7 +384,7 @@ async function runOnce() {
 
       reports.push(
         `🖥️ <b>服务器 ${sIndex}</b>:\n` +
-        `   ⚡ <b>运行状态</b>: ${isRunning ? '正常运行中 (Connected & Running)' : '未完全运行'}\n` +
+        `   ⚡ <b>运行状态</b>: ${isRunning ? '正常运行中 (Connected & Running)' : '未完全处于运行状态'}\n` +
         `   📅 <b>长效租期</b>: ${billRes.status}`
       );
     }
@@ -398,7 +412,6 @@ async function runOnce() {
   }
 }
 
-// 执行入口
 (async () => {
   await runOnce();
 })();
