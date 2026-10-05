@@ -82,6 +82,7 @@ async function doLogin(page, email, password) {
   await emailInput.fill(email);
 
   const passInput = page.locator('input[type="password"]').first();
+  await passInput.click();
   await passInput.fill(password);
   await page.waitForTimeout(300);
 
@@ -119,13 +120,11 @@ async function ensureServerRunning(page) {
 
   await cleanPopup(page);
 
-  // 精准判定函数：同时满足状态卡片处于 running 且有活跃绿点或监控活跃
+  // 精准判定函数：同时满足页面处于 connected 状态且右上角 Resource usage 呈现 running 徽章
   const isServerRunning = async () => {
     return await page.evaluate(() => {
       const fullText = (document.body ? document.body.innerText : '').toLowerCase();
-      // 包含 connected 标识
       const hasConnected = fullText.includes('connected');
-      // 包含 Resource usage 下方的 running 标识
       const hasRunningBadge = Array.from(document.querySelectorAll('*')).some(el => {
         const t = (el.innerText || el.textContent || '').trim().toLowerCase();
         return t === 'running' && el.children.length === 0;
@@ -163,7 +162,7 @@ async function ensureServerRunning(page) {
     }
   }
 
-  // 备用穿透：如果上述选择器未命中，直接遍历 SVG 多边形图标所在的按钮
+  // 备用穿透：如果上述选择器未命中，直接遍历 SVG 三角多边形图元
   if (!startClicked) {
     console.log('🔄 备用策略：深度遍历 SVG 三角图元并触发点击...');
     startClicked = await page.evaluate(() => {
@@ -172,7 +171,6 @@ async function ensureServerRunning(page) {
         const svg = b.querySelector('svg');
         if (svg) {
           const html = svg.innerHTML.toLowerCase();
-          // lucide-play 的 svg path 包含多边形或三角形属性
           if (html.includes('polygon') || svg.classList.contains('lucide-play') || b.getAttribute('aria-label') === 'Start') {
             b.click();
             return true;
@@ -233,7 +231,7 @@ async function extractExpiryTime(page) {
   });
 }
 
-// 核对并处理 Plan 租期，只截图剩余时长卡片
+// 核对并处理 Plan 租期，精确只裁剪 TIME UNTIL EXPIRY 倒计时小卡片
 async function handleBillingRenew(page) {
   let savedScreenshot = null;
   try {
@@ -279,47 +277,51 @@ async function handleBillingRenew(page) {
         }
       }
 
-      // 精确只裁剪剩余时长模块卡片
+      // 精确只裁剪图 2 对应的纯倒计时小卡片区域
       try {
         fs.mkdirSync('screenshots', { recursive: true });
         savedScreenshot = path.join('screenshots', `billing-${Date.now()}.png`);
 
-        const expiryHeader = page.locator('text="TIME UNTIL EXPIRY"').first();
-        let clipped = false;
+        const expiryTitle = page.locator('text="TIME UNTIL EXPIRY"').first();
+        await expiryTitle.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(500);
 
-        if (await expiryHeader.isVisible({ timeout: 2500 }).catch(() => false)) {
-          const cardBox = await expiryHeader.evaluate(el => {
-            let p = el.parentElement;
-            for (let i = 0; i < 3 && p; i++) {
+        const targetBox = await expiryTitle.evaluate(titleEl => {
+          let p = titleEl.parentElement;
+          while (p) {
+            const txt = p.innerText || '';
+            if (txt.includes('TIME UNTIL EXPIRY') && txt.includes('Renews on demand')) {
               const r = p.getBoundingClientRect();
-              if (r.width > 120 && r.height > 50) {
-                return { x: r.x, y: r.y, width: r.width, height: r.height };
-              }
-              p = p.parentElement;
+              // 限制裁剪范围：只圈定左下角倒计时区域，避开右侧 Renew now 按钮
+              return {
+                x: r.x,
+                y: r.y,
+                width: Math.min(r.width, 275),
+                height: r.height
+              };
             }
-            return null;
-          });
-
-          if (cardBox && cardBox.width > 0 && cardBox.height > 0) {
-            await page.screenshot({
-              path: savedScreenshot,
-              clip: {
-                x: Math.max(0, cardBox.x - 8),
-                y: Math.max(0, cardBox.y - 8),
-                width: cardBox.width + 16,
-                height: cardBox.height + 16
-              }
-            });
-            clipped = true;
-            console.log(`📸 已成功截取租期时长小卡片: ${savedScreenshot}`);
+            p = p.parentElement;
           }
-        }
+          const r = titleEl.getBoundingClientRect();
+          return { x: r.x - 5, y: r.y - 5, width: 260, height: 115 };
+        });
 
-        if (!clipped) {
-          await page.screenshot({ path: savedScreenshot, fullPage: false });
+        if (targetBox && targetBox.width > 0 && targetBox.height > 0) {
+          await page.screenshot({
+            path: savedScreenshot,
+            clip: {
+              x: Math.max(0, targetBox.x),
+              y: Math.max(0, targetBox.y),
+              width: targetBox.width + 10,
+              height: targetBox.height + 8
+            }
+          });
+          console.log(`📸 已成功截取精准倒计时小卡片: ${savedScreenshot}`);
+        } else {
+          await expiryTitle.screenshot({ path: savedScreenshot });
         }
       } catch (err) {
-        console.log('⚠️ 截取时长卡片异常:', err.message);
+        console.log('⚠️ 截取倒计时卡片异常:', err.message);
       }
 
       return { status: renewStatus, screenshot: savedScreenshot };
@@ -334,7 +336,7 @@ async function handleBillingRenew(page) {
 async function runOnce() {
   const email = (process.env.FREE_EMAIL || 'yuxiaojie0322@gmail.com').trim();
   const password = process.env.FREE_PASSWORD || 'YxJ223512@';
-  // 修正为准确的服务器 ID URL
+  // 修正为抓包中的真实服务器 ID URL
   const rawUrls = (process.env.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2').trim();
   const proxyUrl = (process.env.PROXY_URL || '').trim();
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
@@ -376,7 +378,7 @@ async function runOnce() {
       // 步骤 1：先确保开机，检测 Running 标识并在必要时点击 Start 三角键
       const isRunning = await ensureServerRunning(page);
 
-      // 步骤 2：确定状态后切换至 Billing 执行租期检查、续期及精准截取时长
+      // 步骤 2：确定状态后切换至 Billing 执行租期检查、续期及精准截取倒计时小卡片
       const billRes = await handleBillingRenew(page);
       if (billRes.screenshot) {
         finalScreenshot = billRes.screenshot;
