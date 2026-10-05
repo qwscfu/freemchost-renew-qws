@@ -89,11 +89,12 @@ async function extractExpiryTime(page, maxTries = 5) {
     proxy: proxyUrl ? { server: proxyUrl } : undefined
   });
 
-  const page = await browser.newPage({
+  const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
   });
 
+  const page = await context.newPage();
   let reports = [];
 
   try {
@@ -147,15 +148,15 @@ async function extractExpiryTime(page, maxTries = 5) {
         await page.waitForTimeout(1500);
         await cleanPopup(page);
 
-        // 积累人机交互防刷时间
-        console.log('⏳ 弹窗停留缓冲 8 秒...');
+        // 积累人机交互防刷时间 (8 秒)
+        console.log('⏳ 弹窗停留缓冲 8 秒 (累积真人交互与防刷签名)...');
         for (let sec = 0; sec < 8; sec++) {
           await cleanPopup(page);
           await page.mouse.move(960 + sec * 5, 540 + sec * 3);
           await page.waitForTimeout(1000);
         }
 
-        // 确保弹窗仍在显示，不在则重新点开
+        // 确保弹窗仍在显示
         const isModalVisible = await page.locator('text="Keep your server online"').isVisible().catch(() => false);
         if (!isModalVisible) {
           console.log('⚠️ 弹窗曾被异常关闭，重新拉起 Renew now...');
@@ -163,24 +164,72 @@ async function extractExpiryTime(page, maxTries = 5) {
           await page.waitForTimeout(1500);
         }
 
-        console.log('👉 定位并点击 [60 hours] 选项...');
+        // 开启底层网络监听：必须抓到真实的提交动作
+        let actionRpcTriggered = false;
+        const rpcCheck = async (res) => {
+          const u = res.url();
+          if (u.includes('_serverFn') && res.status() === 200) {
+            try {
+              const body = await res.text();
+              if (!body.includes('feedback') && !body.includes('bonuses')) {
+                actionRpcTriggered = true;
+                console.log(`📡 抓取到实际加时 RPC 响应: ${u.substring(0, 50)}...`);
+              }
+            } catch (e) {}
+          }
+        };
+        page.on('response', rpcCheck);
+
+        console.log('👉 启动多模态实体物理击发 [60 hours]...');
         const targetOption = page.locator('div, button').filter({ hasText: /^60 hours/i }).last();
         await targetOption.waitFor({ state: 'visible', timeout: 8000 });
-        
-        await targetOption.hover();
-        await page.waitForTimeout(300);
-        await targetOption.click({ force: true });
-        console.log('👆 已完成点击！');
+        await targetOption.scrollIntoViewIfNeeded().catch(() => {});
 
-        console.log('⏳ 等待后端入库事务完全提交并落库 (10 秒)...');
+        // 方案 1: 真实鼠标物理点按（包含完整 mousedown -> mouseup 周期）
+        const box = await targetOption.boundingBox();
+        if (box) {
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+          await page.waitForTimeout(150);
+          await page.mouse.down();
+          await page.waitForTimeout(150);
+          await page.mouse.up();
+        }
+
+        // 方案 2: 原生 click + 键盘 Enter / Space 兜底触发
+        await targetOption.click({ delay: 80 }).catch(() => {});
+        await page.keyboard.press('Enter');
+        await page.keyboard.press('Space');
+
+        // 方案 3: 触发可能存在的父级表单直接提交
+        await page.evaluate(() => {
+          const cardEl = Array.from(document.querySelectorAll('*')).find(el => (el.textContent || '').includes('60 hours'));
+          if (cardEl) {
+            const form = cardEl.closest('form');
+            if (form) form.requestSubmit();
+            cardEl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          }
+        });
+
+        // 等待发包确认
+        for (let waitSec = 0; waitSec < 6; waitSec++) {
+          if (actionRpcTriggered) break;
+          await page.waitForTimeout(1000);
+        }
+        page.off('response', rpcCheck);
+
+        console.log('⏳ 等待后端入库事务处理 (10 秒)...');
         await page.waitForTimeout(10000);
         await cleanPopup(page);
 
-        // 原生硬刷新并重新抓取最新真实数据
-        console.log('🔄 硬刷新当前服务器详情页核对最终时长...');
-        await page.reload({ waitUntil: 'networkidle' }).catch(async () => {
-          await page.reload({ waitUntil: 'domcontentloaded' });
+        // 核心解药：彻底清除客户端本地缓存（LocalStorage / SessionStorage），再硬拉真实数据
+        console.log('🧹 清理客户端本地缓存，强迫 SPA 从服务端获取真实落库数据...');
+        await page.evaluate(() => {
+          localStorage.clear();
+          sessionStorage.clear();
         });
+
+        console.log('🔄 重新导航至页面验证最新真实时长...');
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(3000);
         await cleanPopup(page);
 
@@ -193,12 +242,14 @@ async function extractExpiryTime(page, maxTries = 5) {
         const finalTime = finalTimeData ? finalTimeData.raw : '未获取到';
         const finalHours = finalTimeData ? finalTimeData.totalHours : remainHours;
 
-        console.log(`⏱️ 终审核验结果: 前序 ${beforeTime} ➔ 最新实际存留: ${finalTime}`);
+        console.log(`⏱️ 终审核验结果: 前序 ${beforeTime} ➔ 数据库实际存留: ${finalTime}`);
 
         if (finalHours > remainHours + 20) {
+          console.log('🎉 终审通过：数据库已确实入账！');
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 (+60h)\n     └ 状态: ${beforeTime} ➔ <b>${finalTime}</b>`);
         } else {
-          reports.push(`🔴 <b>服务器 ${sIndex}</b>: 触发点击未增加时间 (当前: ${finalTime})\n     └ 状态: 下个定时周期自动复查`);
+          console.log('⚠️ 终审核验未通过：时间未见实质增加。');
+          reports.push(`🔴 <b>服务器 ${sIndex}</b>: 触发点击未增加时间 (当前: ${finalTime})\n     └ 状态: 建议检查是否有其它限制`);
         }
       } else {
         console.log(`⏳ 剩余时长 ${beforeTime} (${remainHours.toFixed(1)}h > 46h)，安全充足，无需操作。`);
