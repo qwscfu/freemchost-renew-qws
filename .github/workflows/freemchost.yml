@@ -13,7 +13,7 @@ concurrency:
 
 permissions:
   actions: write
-  contents: read
+  contents: write # 必须为 write，否则更新 time.txt 时的 git push 会被 403 拒绝
 
 jobs:
   browser-auto-renew:
@@ -25,6 +25,9 @@ jobs:
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       - name: 设置 Node.js 环境
         uses: actions/setup-node@v4
@@ -58,7 +61,7 @@ jobs:
           SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: socks5://127.0.0.1:1080
+          PROXY_URL: socks5://127.0.0.1:1080 # 确保 Playwright 连入 sing-box 本地端口
         run: node renew.js
 
       - name: 归档运行截图凭据
@@ -70,11 +73,31 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: 🧹 清理历史运行日志（保留最新 3 次）
+      # 更新时间到 time.txt，避免长期未更新导致 GitHub Actions 定时任务自动暂停
+      - name: 🕒 更新时间
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin main
+          fi
+
+      - name: 🧹 清理旧的工作流运行记录
         if: always()
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
