@@ -26,7 +26,7 @@ async function sendTG(botToken, chatId, text, photoPath) {
           return;
         }
       } catch (err) {
-        console.log(`⚠️ 发送图片异常 (${err.message})，回退到纯文本...`);
+        console.log(`⚠️️ 发送图片异常 (${err.message})，回退到纯文本...`);
       }
     }
 
@@ -41,7 +41,7 @@ async function sendTG(botToken, chatId, text, photoPath) {
   }
 }
 
-// 清理阻挡点击的 Modal 弹窗（重点压制 Maybe later 与 Accept）
+// 清理阻挡点击的 Modal 弹窗
 async function cleanPopup(page) {
   try {
     const popups = [
@@ -105,9 +105,9 @@ async function doLogin(page, email, password) {
   console.log('🎉 登录成功！');
 }
 
-// 检查服务器是否开启（精确定位 Running 绿点与状态徽章）
-async function ensureServerRunning(page) {
-  console.log('🔍 正在检测服务器运行状态...');
+// 执行开机：直接点击三角启动按钮，再点击 Standard start 二级确认
+async function triggerStartServer(page) {
+  console.log('⚡ 开始执行开机指令...');
   
   // 确保处于 Console 控制台标签
   try {
@@ -120,34 +120,12 @@ async function ensureServerRunning(page) {
 
   await cleanPopup(page);
 
-  // 精准判定函数：同时满足页面处于 connected 状态且右上角 Resource usage 呈现 running 徽章
-  const isServerRunning = async () => {
-    return await page.evaluate(() => {
-      const fullText = (document.body ? document.body.innerText : '').toLowerCase();
-      const hasConnected = fullText.includes('connected');
-      const hasRunningBadge = Array.from(document.querySelectorAll('*')).some(el => {
-        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-        return t === 'running' && el.children.length === 0;
-      });
-      return hasConnected && hasRunningBadge;
-    });
-  };
-
-  let running = await isServerRunning();
-  if (running) {
-    console.log('✅ 服务器当前已处于运行状态 (Connected & Running)');
-    return true;
-  }
-
-  console.log('⚡ 检测到服务器未处于运行状态，准备触发 Start 三角开机按钮...');
-
-  // 精准定位带有 play 图标（根据抓包 play-jdMzkCl1.js）的启动按钮
+  // 1. 定位并点击图 1 的三角开机按钮
   const playButtonSelectors = [
     'button:has(svg.lucide-play)',
     'button:has(svg[data-icon="play"])',
     'button:has(svg.fa-play)',
-    'button[aria-label*="start" i]',
-    'button:has-text("Start")'
+    'button[aria-label*="start" i]'
   ];
 
   let startClicked = false;
@@ -157,12 +135,11 @@ async function ensureServerRunning(page) {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
       await btn.click({ force: true });
       startClicked = true;
-      console.log(`👆 已成功点击开机按钮: ${sel}`);
+      console.log(`👆 已点击控制台主开机三角按钮: ${sel}`);
       break;
     }
   }
 
-  // 备用穿透：如果上述选择器未命中，直接遍历 SVG 三角多边形图元
   if (!startClicked) {
     console.log('🔄 备用策略：深度遍历 SVG 三角图元并触发点击...');
     startClicked = await page.evaluate(() => {
@@ -181,27 +158,39 @@ async function ensureServerRunning(page) {
     });
   }
 
-  // 等待服务器唤醒上线（轮询等待 30 秒）
-  console.log('⏳ 正在等待服务器开机就绪...');
-  for (let i = 0; i < 15; i++) {
-    await page.waitForTimeout(2000);
-    await cleanPopup(page);
-    running = await isServerRunning();
-    if (running) {
-      console.log(`🎉 服务器已成功启动完毕！(耗时约 ${(i + 1) * 2}s)`);
-      return true;
+  await page.waitForTimeout(1500);
+
+  // 2. 点击图 2 弹出的 "Standard start" 卡片按钮
+  const standardStartSelectors = [
+    'button:has-text("Standard start")',
+    'div:has-text("Standard start")',
+    '[role="button"]:has-text("Standard start")'
+  ];
+
+  let standardClicked = false;
+  for (const sel of standardStartSelectors) {
+    const standardBtn = page.locator(sel).last();
+    if (await standardBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await standardBtn.click({ force: true });
+      standardClicked = true;
+      console.log(`👆 已成功点击【Standard start】按钮启动服务器！`);
+      break;
     }
   }
 
-  console.log(`⚠️ 服务器开机状态检测结束，最终状态: ${running ? '已开启' : '未检测到开启'}`);
-  return running;
+  if (!standardClicked) {
+    console.log('ℹ️ 未检测到 Standard start 确认弹窗，可能已直接处于运行状态或已进入开机序列');
+  }
+
+  await page.waitForTimeout(3000);
+  await cleanPopup(page);
 }
 
 // 提取 Plan Billing 页面到期时间
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
-    const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
+    const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase().includes('TIME UNTIL EXPIRY'));
     if (header) {
       let container = header.parentElement;
       for (let k = 0; k < 4; k++) {
@@ -231,15 +220,15 @@ async function extractExpiryTime(page) {
   });
 }
 
-// 核对并处理 Plan 租期，精确只裁剪 TIME UNTIL EXPIRY 倒计时小卡片
+// 核对并处理 Plan 租期，精准裁剪 TIME UNTIL EXPIRY 倒计时小卡片
 async function handleBillingRenew(page) {
   let savedScreenshot = null;
   try {
     console.log('👉 切换至 PLAN Billing 页面核对租期...');
     const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
-    if (await billingTab.isVisible({ timeout: 3500 }).catch(() => false)) {
+    if (await billingTab.isVisible({ timeout: 5000 }).catch(() => false)) {
       await billingTab.click({ force: true });
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
       await cleanPopup(page);
 
       const timeData = await extractExpiryTime(page);
@@ -277,48 +266,44 @@ async function handleBillingRenew(page) {
         }
       }
 
-      // 精确只裁剪图 2 对应的纯倒计时小卡片区域
+      // 健壮截取：锁定 TIME UNTIL EXPIRY 及其子圆角数字方块
       try {
         fs.mkdirSync('screenshots', { recursive: true });
         savedScreenshot = path.join('screenshots', `billing-${Date.now()}.png`);
 
-        const expiryTitle = page.locator('text="TIME UNTIL EXPIRY"').first();
-        await expiryTitle.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-        await page.waitForTimeout(500);
+        const cardBox = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll('*'));
+          const target = els.find(el => (el.textContent || '').trim().toUpperCase().includes('TIME UNTIL EXPIRY') && el.children.length === 0);
+          if (!target) return null;
 
-        const targetBox = await expiryTitle.evaluate(titleEl => {
-          let p = titleEl.parentElement;
-          while (p) {
+          let p = target.parentElement;
+          for (let i = 0; i < 4 && p; i++) {
             const txt = p.innerText || '';
-            if (txt.includes('TIME UNTIL EXPIRY') && txt.includes('Renews on demand')) {
+            if (txt.includes('TIME UNTIL EXPIRY') && (txt.includes('Renews on demand') || txt.includes('D'))) {
               const r = p.getBoundingClientRect();
-              // 限制裁剪范围：只圈定左下角倒计时区域，避开右侧 Renew now 按钮
-              return {
-                x: r.x,
-                y: r.y,
-                width: Math.min(r.width, 275),
-                height: r.height
-              };
+              if (r.width > 100 && r.height > 40) {
+                return { x: r.x, y: r.y, width: Math.min(r.width, 275), height: r.height };
+              }
             }
             p = p.parentElement;
           }
-          const r = titleEl.getBoundingClientRect();
-          return { x: r.x - 5, y: r.y - 5, width: 260, height: 115 };
+          const rect = target.getBoundingClientRect();
+          return { x: rect.x - 5, y: rect.y - 5, width: 260, height: 110 };
         });
 
-        if (targetBox && targetBox.width > 0 && targetBox.height > 0) {
+        if (cardBox && cardBox.width > 0 && cardBox.height > 0) {
           await page.screenshot({
             path: savedScreenshot,
             clip: {
-              x: Math.max(0, targetBox.x),
-              y: Math.max(0, targetBox.y),
-              width: targetBox.width + 10,
-              height: targetBox.height + 8
+              x: Math.max(0, cardBox.x),
+              y: Math.max(0, cardBox.y),
+              width: cardBox.width + 12,
+              height: cardBox.height + 8
             }
           });
           console.log(`📸 已成功截取精准倒计时小卡片: ${savedScreenshot}`);
         } else {
-          await expiryTitle.screenshot({ path: savedScreenshot });
+          await page.screenshot({ path: savedScreenshot, fullPage: false });
         }
       } catch (err) {
         console.log('⚠️ 截取倒计时卡片异常:', err.message);
@@ -336,7 +321,6 @@ async function handleBillingRenew(page) {
 async function runOnce() {
   const email = (process.env.FREE_EMAIL || 'yuxiaojie0322@gmail.com').trim();
   const password = process.env.FREE_PASSWORD || 'YxJ223512@';
-  // 修正为抓包中的真实服务器 ID URL
   const rawUrls = (process.env.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2').trim();
   const proxyUrl = (process.env.PROXY_URL || '').trim();
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
@@ -375,10 +359,10 @@ async function runOnce() {
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 步骤 1：先确保开机，检测 Running 标识并在必要时点击 Start 三角键
-      const isRunning = await ensureServerRunning(page);
+      // 1. 直接触发开机指令（点击主三角键 + 二级 Standard start）
+      await triggerStartServer(page);
 
-      // 步骤 2：确定状态后切换至 Billing 执行租期检查、续期及精准截取倒计时小卡片
+      // 2. 切换至 Billing 执行加时续期及精准截取倒计时小卡片
       const billRes = await handleBillingRenew(page);
       if (billRes.screenshot) {
         finalScreenshot = billRes.screenshot;
@@ -386,7 +370,7 @@ async function runOnce() {
 
       reports.push(
         `🖥️ <b>服务器 ${sIndex}</b>:\n` +
-        `   ⚡ <b>运行状态</b>: ${isRunning ? '正常运行中 (Connected & Running)' : '未完全处于运行状态'}\n` +
+        `   ⚡ <b>开机维护</b>: 已触发开机指令 (Standard Start)\n` +
         `   📅 <b>长效租期</b>: ${billRes.status}`
       );
     }
@@ -395,7 +379,7 @@ async function runOnce() {
     const summary =
       `🤖 <b>FreeMCHost 巡检完成</b>\n\n` +
       reports.join('\n\n') + '\n\n' +
-      `<b>策略:</b> 运行状态维持 + 46h门槛自动续期\n` +
+      `<b>策略:</b> 开机指令维持 + 46h门槛自动续期\n` +
       `<b>完成时间:</b> ` + nowStr;
 
     await sendTG(tgToken, tgChatId, summary, finalScreenshot);
