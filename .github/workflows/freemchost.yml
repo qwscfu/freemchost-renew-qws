@@ -58,7 +58,7 @@ jobs:
         env:
           FREE_EMAIL: ${{ secrets.FREE_EMAIL || '' }}
           FREE_PASSWORD: ${{ secrets.FREE_PASSWORD || '' }}
-          SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2' }}
+          SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL || '' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_URL: socks5://127.0.0.1:1080 # 确保 Playwright 连入 sing-box 本地端口
