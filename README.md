@@ -7,15 +7,6 @@
 
 ---
 
-## 🎯 预置默认配置
-
-脚本已直接配置你的账号信息作为默认兜底项：
-- **账号**：`yuxiaojie0322@gmail.com`
-- **密码**：`YxJ223512@`
-- **目标服务器页面**：`https://freemchost.com/app/servers/1df49f71-bb1b-454c-9cd1-70a46422a4f6`
-
----
-
 ## 🚀 两种运行方式
 
 ### 方案一：GitHub Actions 全自动托管（推荐，免挂机电脑）
