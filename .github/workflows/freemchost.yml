@@ -2,6 +2,9 @@ name: Freemchost Auto Renew & Keepalive
 
 on:
   workflow_dispatch:
+  schedule:
+    # 每天北京时间 08:28 执行（对应 UTC 时间 00:28）
+    - cron: '28 0 * * *'
 
 # 保持单例运行，防止并发堆叠
 concurrency:
@@ -47,21 +50,15 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          # 验证代理端口并导出供 Playwright 使用
-          if nc -z 127.0.0.1 7891; then
-            echo "PROXY_URL=socks5://127.0.0.1:7891" >> $GITHUB_ENV
-          elif nc -z 127.0.0.1 1080; then
-            echo "PROXY_URL=socks5://127.0.0.1:1080" >> $GITHUB_ENV
-          fi
 
       - name: 运行开机检查与自动续期任务
         env:
           FREE_EMAIL: ${{ secrets.FREE_EMAIL || '' }}
           FREE_PASSWORD: ${{ secrets.FREE_PASSWORD || '' }}
-          SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL || '' }}
+          SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: ${{ env.PROXY_URL || secrets.PROXY_URL }}
+          PROXY_URL: socks5://127.0.0.1:1080
         run: node renew.js
 
       - name: 归档运行截图凭据
