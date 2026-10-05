@@ -1,4 +1,4 @@
-# FreeMCHost 自动保活与永久续期脚本
+# FreeMCHost 自动续期脚本
 
 > 专为 FreeMCHost 免费 Minecraft 服务器设计的自动化工具：
 > 1. **服务器唤醒（Auto Start）**：无论服务器是否开机，均点击 **Start** 开机（已开机状态无影响）。
