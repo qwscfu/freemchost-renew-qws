@@ -2,7 +2,11 @@ name: Freemchost Auto Renew & Keepalive
 
 on:
   workflow_dispatch:
-  # schedule 定时已交由外部白虎面板精准触发，避免 GitHub 队列调度延迟
+
+# 核心锁：保证 40 分钟周期内绝不产生重叠并行
+concurrency:
+  group: freemchost-renew-single
+  cancel-in-progress: false
 
 permissions:
   actions: write
@@ -11,59 +15,45 @@ permissions:
 jobs:
   browser-auto-renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     env:
       NODE_LINK: ${{ secrets.NODE_LINK }}
 
     steps:
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Node.js 环境
+      - name: 准备 Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: 缓存 Playwright 浏览器依赖
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-v1
-
-      - name: 安装依赖与 Chromium 内核
+      - name: 安装依赖
         run: |
           npm init -y
           npm install playwright js-yaml
           npx playwright install chromium
 
-      - name: 🚀 启动代理内核（如有配置 NODE_LINK）
+      - name: 启动代理内核
         if: ${{ env.NODE_LINK != '' }}
         run: |
-          echo "🌐 识别到 NODE_LINK，初始化代理转换..."
-          
-          # 1. 节点硬编码临时 HTTP 托管
           echo "$NODE_LINK" > node.txt
           python3 -m http.server 8080 &
           
-          # 2. 下载并启动 Subconverter
           wget -qO sub.tar.gz https://github.com/tindy2013/subconverter/releases/latest/download/subconverter_linux64.tar.gz
           tar -xf sub.tar.gz
           nohup ./subconverter/subconverter > sub.log 2>&1 &
           sleep 2
           
-          # 3. 下载并解压 Mihomo 内核
           wget -qO mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.18.2/mihomo-linux-amd64-v1.18.2.gz
           gunzip mihomo.gz
           chmod +x mihomo
           
-          # 4. 生成配置解析脚本
           cat << 'EOF' > parse_node.js
           const fs = require('fs');
           const http = require('http');
           const url = require('url');
           const yaml = require('js-yaml');
-
           const nodeLink = (process.env.NODE_LINK || '').trim();
 
           async function trySubconverter() {
@@ -71,13 +61,7 @@ jobs:
               http.get('http://127.0.0.1:25500/sub?target=clash&url=http://127.0.0.1:8080/node.txt&insert=false', (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                  if (data.includes('proxies:') && data.includes('name:')) {
-                    resolve(data);
-                  } else {
-                    resolve(null);
-                  }
-                });
+                res.on('end', () => resolve(data.includes('proxies:') ? data : null));
               }).on('error', () => resolve(null));
             });
           }
@@ -114,25 +98,13 @@ jobs:
                 n['reality-opts'] = { 'public-key': u.searchParams.get('pbk') || '' };
                 if (u.searchParams.get('sid')) n['reality-opts']['short-id'] = u.searchParams.get('sid');
               }
-              if (n.network === 'ws') {
-                n['ws-opts'] = { path: u.searchParams.get('path') || '/' };
-                if (u.searchParams.get('host')) n['ws-opts'].headers = { Host: u.searchParams.get('host') };
-              } else if (n.network === 'grpc') {
-                n['grpc-opts'] = { 'grpc-service-name': u.searchParams.get('serviceName') || '' };
-              }
               return n;
             }
             if (link.startsWith('vmess://')) {
               let b64 = link.substring(8);
               b64 += '='.repeat((4 - (b64.length % 4)) % 4);
               const data = JSON.parse(Buffer.from(b64, 'base64').toString('utf-8'));
-              const n = { name: 'node', type: 'vmess', server: data.add, port: parseInt(data.port || 443), uuid: data.id, alterId: parseInt(data.aid || 0), cipher: 'auto', tls: data.tls === 'tls', network: data.net || 'tcp' };
-              if (data.sni) n.servername = data.sni;
-              if (n.network === 'ws') {
-                n['ws-opts'] = { path: data.path || '/' };
-                if (data.host) n['ws-opts'].headers = { Host: data.host };
-              }
-              return n;
+              return { name: 'node', type: 'vmess', server: data.add, port: parseInt(data.port || 443), uuid: data.id, alterId: parseInt(data.aid || 0), cipher: 'auto', tls: data.tls === 'tls', network: data.net || 'tcp' };
             }
             if (link.startsWith('trojan://')) {
               const u = new url.URL(link);
@@ -147,47 +119,20 @@ jobs:
           (async () => {
             const subRes = await trySubconverter();
             if (subRes) {
-              console.log('✅ Subconverter 转换成功');
               fs.writeFileSync('config.yaml', 'socks-port: 7891\nallow-lan: true\nmode: global\n' + subRes);
             } else {
-              console.log('⚠️ Subconverter 未生效，切换原生节点解析...');
               const nodeObj = parseRawLink(nodeLink);
-              if (!nodeObj) {
-                console.error('❌ 无法识别 NODE_LINK 格式');
-                process.exit(1);
-              }
-              
-              const configObj = {
-                'socks-port': 7891,
-                'allow-lan': true,
-                'mode': 'global',
-                'proxies': [ nodeObj ]
-              };
-              
-              fs.writeFileSync('config.yaml', yaml.dump(configObj));
+              if (!nodeObj) process.exit(1);
+              fs.writeFileSync('config.yaml', yaml.dump({ 'socks-port': 7891, 'allow-lan': true, 'mode': 'global', 'proxies': [ nodeObj ] }));
             }
-            console.log('✅ Mihomo 配置文件 config.yaml 就绪');
           })();
           EOF
-          
-          # 执行节点配置生成
+
           node parse_node.js
-          
-          # 启动后台 Mihomo
           nohup ./mihomo -d . -f config.yaml > mihomo.log 2>&1 &
           sleep 4
-          
-          # 连通性测试
-          if nc -z 127.0.0.1 7891; then
-            echo "🎉 代理内核启动完成，SOCKS5 端口: 127.0.0.1:7891"
-          else
-            echo "❌ 代理内核启动失败，查看日志:"
-            cat config.yaml
-            cat mihomo.log
-            exit 1
-          fi
 
-      - name: 运行保活与自动续期任务
+      - name: 执行续期任务
         env:
           FREE_EMAIL: ${{ secrets.FREE_EMAIL || 'yuxiaojie0322@gmail.com' }}
           FREE_PASSWORD: ${{ secrets.FREE_PASSWORD || 'YxJ223512@' }}
@@ -197,16 +142,16 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL || (env.NODE_LINK != '' && 'socks5://127.0.0.1:7891' || '') }}
         run: node renew.js
 
-      - name: 归档运行截图凭据
+      - name: 归档运行截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Freemchost-Screenshots-${{ github.run_number }}
           path: screenshots/*.png
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 3
 
-      - name: 🧹 清理历史运行日志（保留最新 3 次）
+      - name: 清理历史日志（仅留最近 3 次）
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
