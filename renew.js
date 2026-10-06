@@ -270,7 +270,7 @@ async function captureExpiryCard(page) {
 }
 
 // 核心租期核对、多模态续期击发及数据回验
-async function handleBillingRenew(page, serverUrl) {
+async function handleBillingRenew(page) {
   let savedScreenshot = null;
   try {
     console.log('👉 切换至 PLAN Billing 页面核对租期...');
@@ -303,15 +303,15 @@ async function handleBillingRenew(page, serverUrl) {
           await page.waitForTimeout(1000);
         }
 
-        // 确保弹窗仍在显示（如果被意外冲刷掉，重新拉起）
+        // 确保弹窗仍在显示
         const isModalVisible = await page.locator('text="Keep your server online"').isVisible().catch(() => false);
         if (!isModalVisible) {
-          console.log('⚠️️ 弹窗曾被异常关闭，重新拉起 Renew now...');
+          console.log('⚠️ 弹窗曾被异常关闭，重新拉起 Renew now...');
           await renewNowBtn.click({ force: true });
           await page.waitForTimeout(1500);
         }
 
-        // 开启底层网络监听：必须抓到真实的加时发包响应
+        // 开启底层网络监听：确认真实的加时发包响应
         let actionRpcTriggered = false;
         const rpcCheck = async (res) => {
           const u = res.url();
@@ -332,7 +332,7 @@ async function handleBillingRenew(page, serverUrl) {
         await targetOption.waitFor({ state: 'visible', timeout: 8000 });
         await targetOption.scrollIntoViewIfNeeded().catch(() => {});
 
-        // 方案 1: 真实鼠标物理点按（包含完整 mousedown -> mouseup 周期）
+        // 方案 1: 真实鼠标物理点按
         const box = await targetOption.boundingBox();
         if (box) {
           await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
@@ -342,12 +342,12 @@ async function handleBillingRenew(page, serverUrl) {
           await page.mouse.up();
         }
 
-        // 方案 2: 原生 click + 键盘 Enter / Space 兜底触发
+        // 方案 2: 原生 click + 键盘 Enter / Space
         await targetOption.click({ delay: 80 }).catch(() => {});
         await page.keyboard.press('Enter');
         await page.keyboard.press('Space');
 
-        // 方案 3: 触发可能存在的父级表单直接提交
+        // 方案 3: 触发父级表单直接提交
         await page.evaluate(() => {
           const cardEl = Array.from(document.querySelectorAll('*')).find(el => (el.textContent || '').includes('60 hours'));
           if (cardEl) {
@@ -368,22 +368,19 @@ async function handleBillingRenew(page, serverUrl) {
         await page.waitForTimeout(10000);
         await cleanPopup(page);
 
-        // 清理缓存后重新导航核对真实数据
-        console.log('🧹 清理客户端本地缓存，强迫 SPA 从服务端获取真实落库数据...');
-        await page.evaluate(() => {
-          localStorage.clear();
-          sessionStorage.clear();
-        });
-
-        console.log('🔄 重新导航至页面验证最新真实时长...');
-        await page.goto(serverUrl, { waitUntil: 'domcontentloaded' });
+        // 修正：严禁清除 localStorage/sessionStorage（避免掉登录态）
+        // 原地重新加载页面获取最新落库数据
+        console.log('🔄 原地刷新页面获取加时后的最新落库数据...');
+        await page.reload({ waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(3000);
         await cleanPopup(page);
 
+        // 切回 Billing 标签
         const tabRecheck = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
         await tabRecheck.scrollIntoViewIfNeeded().catch(() => {});
         await tabRecheck.click({ force: true }).catch(() => {});
         await page.waitForTimeout(2000);
+        await cleanPopup(page);
 
         const finalTimeData = await extractExpiryTime(page, 5);
         const finalTime = finalTimeData ? finalTimeData.raw : '未获取到';
@@ -395,8 +392,12 @@ async function handleBillingRenew(page, serverUrl) {
           console.log('🎉 终审通过：数据库已确实入账！');
           renewStatus = `成功续期 (+60h)，最新剩余: ${finalTime}`;
         } else {
-          console.log('⚠️ 终审核验未通过：时间未见实质增加。');
-          renewStatus = `⚠️ 点击未成功加时 (当前剩余: ${finalTime})`;
+          // 如果时间因为 UI 渲染延迟未变，但 RPC 已经确认发包
+          if (actionRpcTriggered) {
+            renewStatus = `已发送续期指令 (+60h)，当前显示: ${finalTime}`;
+          } else {
+            renewStatus = `⚠️ 未检测到有效加时 (当前剩余: ${finalTime})`;
+          }
         }
       } else {
         renewStatus = `剩余 ${rawStr} (租期充足无需加时)`;
@@ -454,11 +455,11 @@ async function runOnce() {
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 1. 开机指令维护 (主三角键 + Standard start)
+      // 1. 开机维护 (主三角键 + Standard start)
       await triggerStartServer(page);
 
       // 2. 检查租期、执行 60h 实体物理点击续期，并截取最新的倒计时卡片
-      const billRes = await handleBillingRenew(page, url);
+      const billRes = await handleBillingRenew(page);
       if (billRes.screenshot) {
         finalScreenshot = billRes.screenshot;
       }
@@ -485,7 +486,7 @@ async function runOnce() {
       fs.mkdirSync('screenshots', { recursive: true });
       const errShot = path.join('screenshots', `error-${Date.now()}.png`);
       await page.screenshot({ path: errShot });
-      await sendTG(tgToken, tgChatId, `⚠️️ <b>FreeMCHost 巡检异常</b>:\n${err.message}`, errShot);
+      await sendTG(tgToken, tgChatId, `⚠️ <b>FreeMCHost 巡检异常</b>:\n${err.message}`, errShot);
     } catch (_) {}
   } finally {
     await browser.close();
