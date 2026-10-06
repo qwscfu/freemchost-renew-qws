@@ -26,7 +26,7 @@ async function sendTG(botToken, chatId, text, photoPath) {
           return;
         }
       } catch (err) {
-        console.log(`⚠️️ 发送图片异常 (${err.message})，回退到纯文本...`);
+        console.log(`⚠️ 发送图片异常 (${err.message})，回退到纯文本...`);
       }
     }
 
@@ -105,11 +105,10 @@ async function doLogin(page, email, password) {
   console.log('🎉 登录成功！');
 }
 
-// 执行开机：直接点击三角启动按钮，再点击 Standard start 二级确认
+// 执行开机指令
 async function triggerStartServer(page) {
   console.log('⚡ 开始执行开机指令...');
   
-  // 确保处于 Console 控制台标签
   try {
     const consoleTab = page.locator('[role="tab"]:has-text("Console"), button:has-text("Console"), a:has-text("Console")').first();
     if (await consoleTab.isVisible({ timeout: 2500 }).catch(() => false)) {
@@ -120,7 +119,6 @@ async function triggerStartServer(page) {
 
   await cleanPopup(page);
 
-  // 1. 定位并点击图 1 的三角开机按钮
   const playButtonSelectors = [
     'button:has(svg.lucide-play)',
     'button:has(svg[data-icon="play"])',
@@ -141,7 +139,6 @@ async function triggerStartServer(page) {
   }
 
   if (!startClicked) {
-    console.log('🔄 备用策略：深度遍历 SVG 三角图元并触发点击...');
     startClicked = await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('button'));
       for (const b of btns) {
@@ -160,7 +157,6 @@ async function triggerStartServer(page) {
 
   await page.waitForTimeout(1500);
 
-  // 2. 点击图 2 弹出的 "Standard start" 卡片按钮
   const standardStartSelectors = [
     'button:has-text("Standard start")',
     'div:has-text("Standard start")',
@@ -179,48 +175,101 @@ async function triggerStartServer(page) {
   }
 
   if (!standardClicked) {
-    console.log('ℹ️ 未检测到 Standard start 确认弹窗，可能已直接处于运行状态或已进入开机序列');
+    console.log('ℹ️ 未检测到 Standard start 确认弹窗，可能已处于运行状态');
   }
 
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(2000);
   await cleanPopup(page);
 }
 
-// 提取 Plan Billing 页面到期时间
+// 提取当前实时的倒计时数据（确保数据最新且带重试机制）
 async function extractExpiryTime(page) {
-  return await page.evaluate(() => {
-    const allEls = Array.from(document.querySelectorAll('*'));
-    const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase().includes('TIME UNTIL EXPIRY'));
-    if (header) {
-      let container = header.parentElement;
-      for (let k = 0; k < 4; k++) {
-        if (container) {
-          const txt = container.innerText || '';
-          const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
-          if (m) {
-            const d = parseInt(m[1], 10);
-            const h = parseInt(m[2], 10);
-            const min = parseInt(m[3], 10);
-            return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+  for (let retry = 0; retry < 5; retry++) {
+    const result = await page.evaluate(() => {
+      const allEls = Array.from(document.querySelectorAll('*'));
+      const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase().includes('TIME UNTIL EXPIRY'));
+      if (header) {
+        let container = header.parentElement;
+        for (let k = 0; k < 4; k++) {
+          if (container) {
+            const txt = container.innerText || '';
+            const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
+            if (m) {
+              const d = parseInt(m[1], 10);
+              const h = parseInt(m[2], 10);
+              const min = parseInt(m[3], 10);
+              return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+            }
+            container = container.parentElement;
           }
-          container = container.parentElement;
         }
       }
-    }
 
-    const bodyText = document.body.innerText || '';
-    const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
-    if (m) {
-      const d = parseInt(m[1], 10);
-      const h = parseInt(m[2], 10);
-      const min = parseInt(m[3], 10);
-      return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
-    }
-    return null;
-  });
+      const bodyText = document.body ? (document.body.innerText || '') : '';
+      const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
+      if (m) {
+        const d = parseInt(m[1], 10);
+        const h = parseInt(m[2], 10);
+        const min = parseInt(m[3], 10);
+        return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+      }
+      return null;
+    });
+
+    if (result) return result;
+    await page.waitForTimeout(1000);
+  }
+  return null;
 }
 
-// 核对并处理 Plan 租期，精准裁剪 TIME UNTIL EXPIRY 倒计时小卡片
+// 精准截取倒计时小卡片函数
+async function captureExpiryCard(page) {
+  fs.mkdirSync('screenshots', { recursive: true });
+  const savedScreenshot = path.join('screenshots', `billing-${Date.now()}.png`);
+
+  try {
+    const cardBox = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('*'));
+      const target = els.find(el => (el.textContent || '').trim().toUpperCase().includes('TIME UNTIL EXPIRY') && el.children.length === 0);
+      if (!target) return null;
+
+      let p = target.parentElement;
+      for (let i = 0; i < 4 && p; i++) {
+        const txt = p.innerText || '';
+        if (txt.includes('TIME UNTIL EXPIRY') && (txt.includes('Renews on demand') || txt.includes('D'))) {
+          const r = p.getBoundingClientRect();
+          if (r.width > 100 && r.height > 40) {
+            return { x: r.x, y: r.y, width: Math.min(r.width, 275), height: r.height };
+          }
+        }
+        p = p.parentElement;
+      }
+      const rect = target.getBoundingClientRect();
+      return { x: rect.x - 5, y: rect.y - 5, width: 260, height: 110 };
+    });
+
+    if (cardBox && cardBox.width > 0 && cardBox.height > 0) {
+      await page.screenshot({
+        path: savedScreenshot,
+        clip: {
+          x: Math.max(0, cardBox.x),
+          y: Math.max(0, cardBox.y),
+          width: cardBox.width + 12,
+          height: cardBox.height + 8
+        }
+      });
+      console.log(`📸 已成功截取精准倒计时小卡片: ${savedScreenshot}`);
+      return savedScreenshot;
+    }
+  } catch (e) {
+    console.log('⚠️ 精确小图截取异常，使用视口截图兜底:', e.message);
+  }
+
+  await page.screenshot({ path: savedScreenshot, fullPage: false });
+  return savedScreenshot;
+}
+
+// 租期检查、续期及截图核心流程
 async function handleBillingRenew(page) {
   let savedScreenshot = null;
   try {
@@ -228,87 +277,80 @@ async function handleBillingRenew(page) {
     const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
     if (await billingTab.isVisible({ timeout: 5000 }).catch(() => false)) {
       await billingTab.click({ force: true });
-      await page.waitForTimeout(2500);
+      await page.waitForTimeout(3000);
       await cleanPopup(page);
 
-      const timeData = await extractExpiryTime(page);
-      const beforeTime = timeData ? timeData.raw : '未获取到';
-      const remainHours = timeData ? timeData.totalHours : 99;
-      console.log(`⏱️ 租期剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
+      // 1. 获取当前实时剩余时间
+      let timeData = await extractExpiryTime(page);
+      let remainHours = timeData ? timeData.totalHours : 99;
+      let rawStr = timeData ? timeData.raw : '未获取到';
+      console.log(`⏱️ 当前租期剩余时长: ${rawStr} (约 ${remainHours.toFixed(1)}h)`);
 
-      let renewStatus = `剩余 ${beforeTime} (租期充足无需加时)`;
+      let renewStatus = '';
 
       if (remainHours < 46) {
-        console.log('🎯 租期 < 46 小时，执行 60h 加时续期...');
+        console.log(`🎯 租期低于 46 小时 (${remainHours.toFixed(1)}h)，必须触发 60h 续期...`);
+        
+        // 点击 Renew now 红色/主按钮
         const renewNowBtn = page.locator('button:has-text("Renew now")').first();
         if (await renewNowBtn.isVisible({ timeout: 5000 })) {
           await renewNowBtn.click({ force: true });
           await page.waitForTimeout(1500);
-          await cleanPopup(page);
 
-          console.log('⏳ 停留 8 秒生成防刷签名 dwell_ms...');
+          // 持续清理可能弹出的干扰弹窗并保持 dwell_ms 鼠标轨迹
+          console.log('⏳ 停留 8 秒生成防刷签名 dwell_ms 并清理弹窗...');
           for (let sec = 0; sec < 8; sec++) {
             await cleanPopup(page);
             await page.mouse.move(960 + sec * 5, 540 + sec * 3);
             await page.waitForTimeout(1000);
           }
 
-          const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
-          if (await card.isEnabled({ timeout: 3000 }).catch(() => false)) {
-            await card.hover();
-            await page.waitForTimeout(300);
-            await card.click({ force: true });
-            console.log('👆 60h 租期续期成功！');
-            await page.waitForTimeout(4000);
+          // 定位 60 hours 免费加时卡片（多重选择器强化）
+          const cardSelectors = [
+            page.locator('button:has-text("60 hours")').first(),
+            page.locator('div:has-text("60 hours")').filter({ hasText: /Free|60 hours/i }).last(),
+            page.locator('[role="dialog"] button').filter({ hasText: '60 hours' }).first(),
+            page.locator('div[role="dialog"] *').filter({ hasText: '60 hours' }).last()
+          ];
+
+          let cardClicked = false;
+          for (const cardLoc of cardSelectors) {
+            if (await cardLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await cardLoc.scrollIntoViewIfNeeded().catch(() => {});
+              await cardLoc.hover().catch(() => {});
+              await page.waitForTimeout(300);
+              await cardLoc.click({ force: true });
+              cardClicked = true;
+              console.log('👆 已成功点击 60h 免费续期卡片！');
+              break;
+            }
+          }
+
+          if (cardClicked) {
+            console.log('⏳ 等待服务器刷新最新加时数据...');
+            await page.waitForTimeout(5000);
             await cleanPopup(page);
-            renewStatus = '已成功加时 (+60h)';
-          }
-        }
-      }
 
-      // 健壮截取：锁定 TIME UNTIL EXPIRY 及其子圆角数字方块
-      try {
-        fs.mkdirSync('screenshots', { recursive: true });
-        savedScreenshot = path.join('screenshots', `billing-${Date.now()}.png`);
-
-        const cardBox = await page.evaluate(() => {
-          const els = Array.from(document.querySelectorAll('*'));
-          const target = els.find(el => (el.textContent || '').trim().toUpperCase().includes('TIME UNTIL EXPIRY') && el.children.length === 0);
-          if (!target) return null;
-
-          let p = target.parentElement;
-          for (let i = 0; i < 4 && p; i++) {
-            const txt = p.innerText || '';
-            if (txt.includes('TIME UNTIL EXPIRY') && (txt.includes('Renews on demand') || txt.includes('D'))) {
-              const r = p.getBoundingClientRect();
-              if (r.width > 100 && r.height > 40) {
-                return { x: r.x, y: r.y, width: Math.min(r.width, 275), height: r.height };
-              }
+            // 重新刷新并提取最新的时间数据
+            const newTimeData = await extractExpiryTime(page);
+            if (newTimeData) {
+              timeData = newTimeData;
+              console.log(`🎉 续期加时成功！最新租期为: ${timeData.raw}`);
             }
-            p = p.parentElement;
+            renewStatus = `已成功加时 (+60h)，最新剩余: ${timeData.raw}`;
+          } else {
+            console.error('❌ 未能成功点击到 60h 续期卡片！');
+            renewStatus = `⚠️ 续期未成功 (未能选中 60h 选项)，当前剩余: ${rawStr}`;
           }
-          const rect = target.getBoundingClientRect();
-          return { x: rect.x - 5, y: rect.y - 5, width: 260, height: 110 };
-        });
-
-        if (cardBox && cardBox.width > 0 && cardBox.height > 0) {
-          await page.screenshot({
-            path: savedScreenshot,
-            clip: {
-              x: Math.max(0, cardBox.x),
-              y: Math.max(0, cardBox.y),
-              width: cardBox.width + 12,
-              height: cardBox.height + 8
-            }
-          });
-          console.log(`📸 已成功截取精准倒计时小卡片: ${savedScreenshot}`);
         } else {
-          await page.screenshot({ path: savedScreenshot, fullPage: false });
+          renewStatus = `⚠️ 未找到 Renew now 按钮，当前剩余: ${rawStr}`;
         }
-      } catch (err) {
-        console.log('⚠️ 截取倒计时卡片异常:', err.message);
+      } else {
+        renewStatus = `剩余 ${rawStr} (租期充足无需加时)`;
       }
 
+      // 2. 无论是否续期，最后均对页面当前的倒计时卡片进行精准截图
+      savedScreenshot = await captureExpiryCard(page);
       return { status: renewStatus, screenshot: savedScreenshot };
     }
   } catch (e) {
@@ -359,10 +401,10 @@ async function runOnce() {
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 1. 直接触发开机指令（点击主三角键 + 二级 Standard start）
+      // 1. 开机指令维护
       await triggerStartServer(page);
 
-      // 2. 切换至 Billing 执行加时续期及精准截取倒计时小卡片
+      // 2. 检查租期、执行 60h 续期，并截取最新的倒计时卡片
       const billRes = await handleBillingRenew(page);
       if (billRes.screenshot) {
         finalScreenshot = billRes.screenshot;
